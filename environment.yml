@@ -1,0 +1,21 @@
+name: digital-twin
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip=23.3
+  - pip:
+    - fastapi>=0.95.0,<0.100.0
+    - uvicorn[standard]>=0.22.0,<0.30.0
+    - websockets>=11.0.3,<12.0.0
+    - python-multipart>=0.0.6
+    - jinja2>=3.1.2
+    - playwright>=1.36.0,<2.0.0
+    - loguru>=0.7.0
+    - python-dotenv>=1.0.0
+    - requests>=2.31.0
+    - pydantic>=1.10.8,<2.0.0
+    - aiodns>=3.0.0
+    - charset-normalizer>=3.0.0
+    - ujson>=5.8.0 

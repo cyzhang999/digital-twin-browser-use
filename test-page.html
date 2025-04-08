@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>数字孪生测试页面</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .test-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .test-section h2 {
+            color: #666;
+            margin-top: 0;
+            margin-bottom: 15px;
+        }
+        .test-box {
+            width: 200px;
+            height: 200px;
+            background-color: #e0e0e0;
+            margin: 20px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .test-box:hover {
+            background-color: #d0d0d0;
+        }
+        .button-group {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 4px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #test-status {
+            text-align: center;
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f8f8;
+            border-radius: 4px;
+        }
+        .success {
+            color: #4CAF50;
+        }
+        .error {
+            color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>数字孪生测试页面</h1>
+        
+        <div class="test-section">
+            <h2>基本交互测试</h2>
+            <div class="test-box" id="test-box">
+                点击测试
+            </div>
+            <div class="button-group">
+                <button id="test-button-1">按钮 1</button>
+                <button id="test-button-2">按钮 2</button>
+                <button id="test-button-3">按钮 3</button>
+            </div>
+            <div id="test-status">等待操作...</div>
+        </div>
+        
+        <div class="test-section">
+            <h2>模型操作测试</h2>
+            <div class="button-group">
+                <button onclick="window.rotateModel({direction: 'left', angle: 45})">旋转</button>
+                <button onclick="window.zoomModel({scale: 1.5})">放大</button>
+                <button onclick="window.focusOnModel({target: 'Area_1'})">聚焦</button>
+                <button onclick="window.resetModel()">重置</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 测试框点击事件
+        document.getElementById('test-box').addEventListener('click', function() {
+            const colors = ['#e0e0e0', '#ffeb3b', '#4CAF50', '#2196F3'];
+            let currentIndex = 0;
+            
+            this.style.backgroundColor = colors[currentIndex];
+            currentIndex = (currentIndex + 1) % colors.length;
+        });
+
+        // 按钮点击事件
+        const buttons = document.querySelectorAll('.button-group button');
+        const status = document.getElementById('test-status');
+        
+        buttons.forEach(button => {
+            button.addEventListener('click', function() {
+                status.textContent = `点击了 ${this.textContent}`;
+                status.className = 'success';
+            });
+        });
+
+        // 模型操作函数
+        window.rotateModel = function(params) {
+            console.log('执行旋转操作:', params);
+            
+            // 获取参数
+            const { target, direction, angle } = params;
+            
+            // 更新状态显示
+            document.getElementById('test-status').textContent = 
+                `旋转操作: ${target || '全局'}, ${direction}, ${angle}度`;
+            document.getElementById('test-status').className = 'success';
+            
+            // 模拟成功执行旋转
+            document.getElementById('test-box').style.transform = 
+                `rotate(${direction === 'left' ? angle : -angle}deg)`;
+                
+            return true;
+        };
+
+        window.zoomModel = function(params) {
+            console.log('执行缩放操作:', params);
+            
+            // 获取参数
+            const { target, scale } = params;
+            
+            // 更新状态显示
+            document.getElementById('test-status').textContent = 
+                `缩放操作: ${target || '全局'}, 比例 ${scale}`;
+            document.getElementById('test-status').className = 'success';
+            
+            // 模拟成功执行缩放
+            document.getElementById('test-box').style.transform = 
+                `scale(${scale})`;
+                
+            return true;
+        };
+
+        window.focusOnModel = function(params) {
+            console.log('执行聚焦操作:', params);
+            
+            // 获取参数
+            const { target } = params;
+            
+            // 更新状态显示
+            document.getElementById('test-status').textContent = 
+                `聚焦操作: ${target || '中心'}`;
+            document.getElementById('test-status').className = 'success';
+            
+            // 模拟成功执行聚焦
+            document.getElementById('test-box').style.border = 
+                '3px solid #2196F3';
+                
+            return true;
+        };
+
+        window.resetModel = function(params) {
+            console.log('执行重置操作:', params);
+            
+            // 更新状态显示
+            document.getElementById('test-status').textContent = '重置操作已执行';
+            document.getElementById('test-status').className = 'success';
+            
+            // 重置所有变化
+            document.getElementById('test-box').style.transform = 'none';
+            document.getElementById('test-box').style.border = 'none';
+            document.getElementById('test-box').style.backgroundColor = '#e0e0e0';
+                
+            return true;
+        };
+
+        // 测试函数
+        window.testFunctions = {
+            getTestBoxColor: function() {
+                return document.getElementById('test-box').style.backgroundColor;
+            },
+            setTestBoxColor: function(color) {
+                document.getElementById('test-box').style.backgroundColor = color;
+            },
+            getStatus: function() {
+                return document.getElementById('test-status').textContent;
+            },
+            setStatus: function(text) {
+                const status = document.getElementById('test-status');
+                status.textContent = text;
+                status.className = 'success';
+            }
+        };
+    </script>
+</body>
+</html> 

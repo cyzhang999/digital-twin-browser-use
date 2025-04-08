@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP协议测试页面 (MCP Protocol Test Page)</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        h1 {
+            grid-column: 1 / -1;
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        .section {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .model-view {
+            min-height: 400px;
+            background-color: #eee;
+            position: relative;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .model-placeholder {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #666;
+        }
+        .controls {
+            margin-top: 10px;
+        }
+        .control-group {
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        h3 {
+            margin-top: 0;
+            color: #2c3e50;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        .reset-btn {
+            background-color: #e74c3c;
+        }
+        .reset-btn:hover {
+            background-color: #c0392b;
+        }
+        .log-section {
+            grid-column: 1 / -1;
+        }
+        .log-container {
+            height: 200px;
+            background-color: #1e1e1e;
+            color: #f8f8f8;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            overflow-y: auto;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 3px 0;
+            border-bottom: 1px solid #333;
+        }
+        .success {
+            color: #4caf50;
+        }
+        .error {
+            color: #ff5252;
+        }
+        .warning {
+            color: #ffb86c;
+        }
+        .info {
+            color: #64b5f6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MCP协议测试页面 (MCP Protocol Test Page)</h1>
+        
+        <div class="section model-view">
+            <div class="model-placeholder">
+                <h2>模型视图 (Model View)</h2>
+                <p>这里将显示3D模型 (3D model will be displayed here)</p>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h3>模型控制 (Model Controls)</h3>
+            
+            <div class="control-group">
+                <h4>旋转 (Rotate)</h4>
+                <button onclick="rotateLeft()">向左旋转 (Rotate Left)</button>
+                <button onclick="rotateRight()">向右旋转 (Rotate Right)</button>
+                <input type="range" id="rotateAngle" min="15" max="180" step="15" value="45">
+                <span id="rotateAngleValue">45°</span>
+            </div>
+            
+            <div class="control-group">
+                <h4>缩放 (Zoom)</h4>
+                <button onclick="zoomIn()">放大 (Zoom In)</button>
+                <button onclick="zoomOut()">缩小 (Zoom Out)</button>
+                <input type="range" id="zoomScale" min="0.5" max="2.5" step="0.1" value="1.5">
+                <span id="zoomScaleValue">1.5x</span>
+            </div>
+            
+            <div class="control-group">
+                <h4>聚焦 (Focus)</h4>
+                <button onclick="focusOnCenter()">中心 (Center)</button>
+                <button onclick="focusOnMeetingRoom()">会议室 (Meeting Room)</button>
+                <button onclick="focusOnOffice()">办公区 (Office Area)</button>
+            </div>
+            
+            <div class="control-group">
+                <button onclick="resetModel()" class="reset-btn">重置视图 (Reset View)</button>
+            </div>
+        </div>
+        
+        <div class="section log-section">
+            <h3>操作日志 (Operation Log)</h3>
+            <div class="log-container" id="logContainer"></div>
+            <button onclick="clearLog()" style="margin-top: 10px;">清除日志 (Clear Log)</button>
+        </div>
+    </div>
+    
+    <script>
+        // 模拟模型操作函数
+        window.rotateModel = function(target, direction, angle) {
+            console.log(`Rotating model: direction=${direction}, angle=${angle}, target=${target}`);
+            addLog(`执行旋转: 方向=${direction}, 角度=${angle}°${target ? ', 目标=' + target : ''}`, 'success');
+            return { success: true, message: '旋转操作已执行' };
+        };
+        
+        window.zoomModel = function(target, scale) {
+            console.log(`Zooming model: scale=${scale}, target=${target}`);
+            addLog(`执行缩放: 比例=${scale}x${target ? ', 目标=' + target : ''}`, 'success');
+            return { success: true, message: '缩放操作已执行' };
+        };
+        
+        window.focusOnModel = function(target) {
+            console.log(`Focusing on: target=${target}`);
+            addLog(`执行聚焦: 目标=${target}`, 'success');
+            return { success: true, message: '聚焦操作已执行' };
+        };
+        
+        window.resetModel = function() {
+            console.log('Resetting model view');
+            addLog('执行重置: 恢复默认视图', 'success');
+            return { success: true, message: '重置操作已执行' };
+        };
+        
+        // 控制操作
+        function rotateLeft() {
+            const angle = document.getElementById('rotateAngle').value;
+            window.rotateModel(null, 'left', parseInt(angle));
+        }
+        
+        function rotateRight() {
+            const angle = document.getElementById('rotateAngle').value;
+            window.rotateModel(null, 'right', parseInt(angle));
+        }
+        
+        function zoomIn() {
+            const scale = document.getElementById('zoomScale').value;
+            window.zoomModel(null, parseFloat(scale));
+        }
+        
+        function zoomOut() {
+            const scale = 1 / parseFloat(document.getElementById('zoomScale').value);
+            window.zoomModel(null, scale);
+        }
+        
+        function focusOnCenter() {
+            window.focusOnModel('center');
+        }
+        
+        function focusOnMeetingRoom() {
+            window.focusOnModel('meeting_room');
+        }
+        
+        function focusOnOffice() {
+            window.focusOnModel('office_area');
+        }
+        
+        function resetView() {
+            window.resetModel();
+        }
+        
+        // 日志功能
+        function addLog(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            const logEntry = document.createElement('div');
+            logEntry.className = `log-entry ${type}`;
+            
+            const now = new Date();
+            const timeString = `${padZero(now.getHours())}:${padZero(now.getMinutes())}:${padZero(now.getSeconds())}`;
+            
+            logEntry.textContent = `[${timeString}] ${message}`;
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+        
+        function clearLog() {
+            document.getElementById('logContainer').innerHTML = '';
+        }
+        
+        function padZero(num) {
+            return num.toString().padStart(2, '0');
+        }
+        
+        // 更新滑块值显示
+        document.getElementById('rotateAngle').addEventListener('input', function() {
+            document.getElementById('rotateAngleValue').textContent = this.value + '°';
+        });
+        
+        document.getElementById('zoomScale').addEventListener('input', function() {
+            document.getElementById('zoomScaleValue').textContent = this.value + 'x';
+        });
+        
+        // 初始化
+        window.onload = function() {
+            addLog('测试页面已加载', 'info');
+            addLog('MCP操作函数已注册', 'info');
+        };
+    </script>
+</body>
+</html> 

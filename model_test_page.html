@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>数字孪生浏览器服务测试页面</title>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 15px;
+            text-align: center;
+            border-radius: 5px 5px 0 0;
+        }
+        
+        .status-panel {
+            background-color: #ecf0f1;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .status-item {
+            margin-bottom: 5px;
+        }
+        
+        .status-label {
+            font-weight: bold;
+            display: inline-block;
+            width: 120px;
+        }
+        
+        .model-container {
+            position: relative;
+            width: 100%;
+            height: 400px;
+            background-color: #fff;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        
+        .model {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            top: 150px;
+            left: 450px;
+            background-color: #3498db;
+            transition: all 0.5s;
+            border-radius: 5px;
+        }
+        
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        
+        button:hover {
+            background-color: #2980b9;
+        }
+        
+        .log-container {
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+        }
+        
+        .log-container p {
+            margin: 5px 0;
+        }
+        
+        .log-info {
+            color: #2ecc71;
+        }
+        
+        .log-warning {
+            color: #f39c12;
+        }
+        
+        .log-error {
+            color: #e74c3c;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>数字孪生浏览器服务测试页面</h1>
+            <p>用于验证MCP服务基本功能</p>
+        </header>
+        
+        <div class="status-panel">
+            <h2>服务状态</h2>
+            <div class="status-item">
+                <span class="status-label">页面就绪:</span>
+                <span id="status-ready">就绪</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">加载时间:</span>
+                <span id="status-load-time"></span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">操作状态:</span>
+                <span id="status-operation">无操作</span>
+            </div>
+        </div>
+        
+        <div class="model-container">
+            <div id="model" class="model"></div>
+        </div>
+        
+        <div class="controls">
+            <button onclick="window.rotateModel({direction:'left', angle:45})">向左旋转45°</button>
+            <button onclick="window.rotateModel({direction:'right', angle:45})">向右旋转45°</button>
+            <button onclick="window.zoomModel({scale:1.5})">放大</button>
+            <button onclick="window.zoomModel({scale:0.6666})">缩小</button>
+            <button onclick="window.focusOnModel({target:'center'})">居中</button>
+            <button onclick="window.resetModel()">重置</button>
+        </div>
+        
+        <div class="log-container" id="log">
+            <p class="log-info">测试页面初始化完成</p>
+        </div>
+    </div>
+    
+    <script>
+        // 模型状态
+        window.modelState = {
+            rotationY: 0,
+            scale: 1,
+            position: { x: 450, y: 150 }
+        };
+        
+        // 日志函数
+        function log(message, type = 'info') {
+            const logElement = document.getElementById('log');
+            const entry = document.createElement('p');
+            entry.classList.add('log-' + type);
+            entry.textContent = message;
+            logElement.appendChild(entry);
+            logElement.scrollTop = logElement.scrollHeight;
+            
+            console.log(message);
+        }
+        
+        // 更新状态
+        function updateStatus(operation) {
+            document.getElementById('status-operation').textContent = operation;
+        }
+        
+        // 模型操作函数
+        window.rotateModel = function(params) {
+            try {
+                const angle = params?.angle || 45;
+                const direction = params?.direction || 'left';
+                const model = document.getElementById('model');
+                
+                updateStatus(`旋转 ${direction} ${angle}°`);
+                
+                const actualAngle = direction === 'left' ? angle : -angle;
+                window.modelState.rotationY += actualAngle;
+                model.style.transform = `rotate(${window.modelState.rotationY}deg) scale(${window.modelState.scale})`;
+                
+                log(`模型已${direction === 'left' ? '向左' : '向右'}旋转 ${angle}°，当前Y轴角度: ${window.modelState.rotationY}°`);
+                return true;
+            } catch(e) {
+                log(`旋转操作失败: ${e.message}`, 'error');
+                return false;
+            }
+        };
+        
+        window.zoomModel = function(params) {
+            try {
+                const scale = params?.scale || 1.5;
+                const model = document.getElementById('model');
+                
+                updateStatus(`缩放 ${scale > 1 ? '放大' : '缩小'} ${scale}x`);
+                
+                window.modelState.scale *= scale;
+                model.style.transform = `rotate(${window.modelState.rotationY}deg) scale(${window.modelState.scale})`;
+                
+                log(`模型已缩放，比例因子: ${scale}，当前比例: ${window.modelState.scale.toFixed(2)}`);
+                return true;
+            } catch(e) {
+                log(`缩放操作失败: ${e.message}`, 'error');
+                return false;
+            }
+        };
+        
+        window.focusOnModel = function(params) {
+            try {
+                const target = params?.target || 'center';
+                const model = document.getElementById('model');
+                
+                updateStatus(`聚焦到 ${target}`);
+                
+                if (target === 'center') {
+                    window.modelState.position = { x: 450, y: 150 };
+                }
+                
+                model.style.left = `${window.modelState.position.x}px`;
+                model.style.top = `${window.modelState.position.y}px`;
+                
+                log(`模型已聚焦到: ${target}`);
+                return true;
+            } catch(e) {
+                log(`聚焦操作失败: ${e.message}`, 'error');
+                return false;
+            }
+        };
+        
+        window.resetModel = function() {
+            try {
+                const model = document.getElementById('model');
+                
+                updateStatus('重置');
+                
+                window.modelState = {
+                    rotationY: 0,
+                    scale: 1,
+                    position: { x: 450, y: 150 }
+                };
+                
+                model.style.transform = '';
+                model.style.left = '450px';
+                model.style.top = '150px';
+                
+                log('模型已重置到初始状态');
+                return true;
+            } catch(e) {
+                log(`重置操作失败: ${e.message}`, 'error');
+                return false;
+            }
+        };
+        
+        // 初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            log('页面已加载，模型准备就绪');
+            document.getElementById('status-load-time').textContent = new Date().toLocaleTimeString();
+            
+            // 添加全局错误处理
+            window.onerror = function(message, source, lineno, colno, error) {
+                log(`JavaScript错误: ${message}`, 'error');
+                return true;
+            };
+            
+            // 验证API是否可用
+            try {
+                if (typeof window.rotateModel === 'function' && 
+                    typeof window.zoomModel === 'function' && 
+                    typeof window.focusOnModel === 'function' && 
+                    typeof window.resetModel === 'function') {
+                    log('所有模型操作API已就绪');
+                } else {
+                    log('部分模型操作API未定义', 'warning');
+                }
+            } catch(e) {
+                log(`API验证失败: ${e.message}`, 'error');
+            }
+        });
+    </script>
+</body>
+</html> 
