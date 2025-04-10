@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ======================================================
-echo 数字孪生浏览器操作服务 (MCP) 启动脚本
+echo 数字孪生浏览器操作服务(MCP) 启动脚本
 echo ======================================================
 echo.
 
@@ -30,29 +30,17 @@ if exist %VENV_DIR%\Scripts\activate.bat (
     call %VENV_DIR%\Scripts\activate.bat
     set PYTHON_CMD=%VENV_DIR%\Scripts\python
 ) else (
-    echo [警告] 未找到虚拟环境 (%VENV_DIR%)。使用系统Python。
+    echo [警告] 未找到虚拟环境(%VENV_DIR%)。使用系统Python。
 )
 
 :: 检查是否安装了必需的依赖
 echo [信息] 检查依赖...
-%PYTHON_CMD% -c "import playwright" 2>nul
+%PYTHON_CMD% -c "import fastapi" 2>nul
 if %ERRORLEVEL% neq 0 (
-    echo [警告] 未找到Playwright。尝试安装...
-    %PYTHON_CMD% -m pip install -r requirements-mcp.txt
+    echo [警告] 未找到fastapi。尝试安装...
+    %PYTHON_CMD% -m pip install -r requirements.txt
     if %ERRORLEVEL% neq 0 (
-        echo [错误] 安装依赖失败。请手动运行: pip install -r requirements-mcp.txt
-        goto :error
-    )
-)
-
-:: 检查是否安装了Playwright浏览器
-echo [信息] 检查Playwright浏览器...
-%PYTHON_CMD% -c "from playwright.sync_api import sync_playwright; print(sync_playwright().__enter__().chromium.executable_path)" 2>nul
-if %ERRORLEVEL% neq 0 (
-    echo [警告] 未找到Playwright浏览器。尝试安装...
-    %PYTHON_CMD% -m playwright install
-    if %ERRORLEVEL% neq 0 (
-        echo [错误] 安装Playwright浏览器失败。请手动运行: playwright install
+        echo [错误] 安装依赖失败。请手动运行: pip install -r requirements.txt
         goto :error
     )
 )
@@ -89,4 +77,6 @@ pause
 exit /b 1
 
 :end
+echo.
+echo [信息] MCP服务已停止。
 endlocal 

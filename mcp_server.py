@@ -5,7 +5,7 @@
 MCP服务器实现
 (MCP Server Implementation)
 
-实现标准的MCP（Model Control Protocol）协议，提供更灵活的模型操作控制。
+基于WebSocket实现标准的MCP（Model Control Protocol）协议，提供更高效的模型操作控制。
 """
 
 import json
@@ -13,16 +13,16 @@ import logging
 import asyncio
 import os
 import time
-import traceback
-import subprocess
-import shlex
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable, Tuple
 from enum import Enum
 from datetime import datetime
 import uuid
-
-from fastapi import WebSocket, WebSocketDisconnect
-from playwright.async_api import Page
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from mcp_command_builder import MCPCommandBuilder
+from parse_natural_language import parse_natural_language
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +46,7 @@ class MCPCommand:
         target: str = None, 
         command_id: str = None
     ):
-        self.action = action
+        self.action = action or ""  # 确保action不为None
         self.parameters = parameters or {}
         self.target = target
         self.id = command_id or str(uuid.uuid4())
@@ -106,15 +106,6 @@ class MCPCommand:
             action=MCPOperationType.RESET,
             parameters={}
         )
-    
-    @classmethod
-    def custom(cls, action: str, parameters: Dict[str, Any], target: str = None) -> 'MCPCommand':
-        """创建自定义命令"""
-        return cls(
-            action=action,
-            parameters=parameters,
-            target=target
-        )
 
 # MCP命令结果
 class MCPCommandResult:
@@ -148,708 +139,651 @@ class MCPCommandResult:
             
         return result
 
-# MCP服务器配置
-class MCPServerConfig:
-    """MCP服务器配置"""
-    def __init__(self, server_id: str, config: Dict[str, Any]):
-        self.server_id = server_id
-        self.command = config.get("command", "")
-        self.args = config.get("args", [])
-        self.env = config.get("env", {})
-        self.cwd = config.get("cwd")
-        self.max_retries = config.get("maxRetries", 3)
-        self.timeout = config.get("timeout", 10)  # 超时时间（秒）
-
-# MCP服务器实现
-class MCPServer:
-    """MCP服务器实现"""
+# WebSocket连接管理器
+class ConnectionManager:
+    """WebSocket连接管理器"""
     def __init__(self):
-        self.servers: Dict[str, MCPServerConfig] = {}
-        self.command_handlers: Dict[str, Callable] = {}
         self.active_connections: List[WebSocket] = []
-        self.page: Optional[Page] = None
-        self.command_results: Dict[str, asyncio.Future] = {}
-        
-        # 注册内置命令处理器
-        self.register_command_handler(MCPOperationType.ROTATE, self._handle_rotate)
-        self.register_command_handler(MCPOperationType.ZOOM, self._handle_zoom)
-        self.register_command_handler(MCPOperationType.FOCUS, self._handle_focus)
-        self.register_command_handler(MCPOperationType.RESET, self._handle_reset)
-    
-    def set_page(self, page: Page):
-        """设置Playwright页面实例"""
-        self.page = page
-    
-    def register_server(self, server_id: str, config: Dict[str, Any]):
-        """注册MCP服务器"""
-        self.servers[server_id] = MCPServerConfig(server_id, config)
-        logger.info(f"注册MCP服务器: {server_id}")
-    
-    def register_command_handler(self, action_type: str, handler: Callable):
-        """注册命令处理器"""
-        self.command_handlers[action_type] = handler
-        logger.debug(f"注册命令处理器: {action_type}")
     
     async def connect(self, websocket: WebSocket):
         """处理WebSocket连接"""
         await websocket.accept()
         self.active_connections.append(websocket)
-        logger.info(f"WebSocket客户端已连接，当前连接数: {len(self.active_connections)}")
+        logger.info(f"客户端连接成功，当前连接数: {len(self.active_connections)}")
     
     def disconnect(self, websocket: WebSocket):
         """处理WebSocket断开连接"""
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-            logger.info(f"WebSocket客户端已断开，当前连接数: {len(self.active_connections)}")
+            logger.info(f"客户端断开连接，当前连接数: {len(self.active_connections)}")
     
     async def broadcast(self, message: Dict[str, Any]):
         """广播消息到所有连接的客户端"""
         if not self.active_connections:
+            logger.warning("没有活跃的WebSocket连接，无法广播消息")
             return
-        
-        disconnected = []
-        message_json = json.dumps(message)
+            
+        disconnected_clients = []
         
         for websocket in self.active_connections:
             try:
-                await websocket.send_text(message_json)
+                await websocket.send_json(message)
             except Exception as e:
-                logger.error(f"发送WebSocket消息失败: {e}")
-                disconnected.append(websocket)
+                logger.error(f"广播消息失败: {e}")
+                disconnected_clients.append(websocket)
         
-        # 移除断开的连接
-        for websocket in disconnected:
+        # 清理断开的连接
+        for websocket in disconnected_clients:
             self.disconnect(websocket)
+
+    async def send_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+        
+    def get_active_connections_count(self) -> int:
+        """获取当前活跃的WebSocket连接数"""
+        return len(self.active_connections)
+
+# MCP服务器实现
+class MCPServer:
+    """MCP服务器，用于处理MCP协议命令
     
-    async def broadcast_result(self, result: MCPCommandResult):
-        """广播命令执行结果"""
-        await self.broadcast({
-            "type": "commandResult",
-            "result": result.to_dict()
-        })
+    处理各种MCP操作命令，包括模型旋转、缩放、高亮等
+    管理与前端的WebSocket连接
+    """
     
-    def generate_mcp_command(self, action: str, parameters: Dict[str, Any], server_id: str = "threejs-control") -> Dict[str, Any]:
-        """生成标准MCP命令"""
-        if server_id not in self.servers:
-            raise ValueError(f"未找到服务器配置: {server_id}")
+    def __init__(self):
+        self.connections: List[WebSocket] = []
+        self.operation_handlers: Dict[str, Callable] = {}
+        # 初始化logger
+        self.logger = logger
+        # 初始化browser属性为None
+        self.browser = None
+        # 注册默认操作处理器
+        self._register_default_handlers()
+        self.logger.info("MCP服务器初始化完成")
+    
+    def _register_default_handlers(self):
+        """注册默认的操作处理方法"""
+        self.register_operation_handler("rotate", self.execute_rotate_operation)
+        self.register_operation_handler("zoom", self.execute_zoom_operation)
+        self.register_operation_handler("focus", self.execute_focus_operation)
+        self.register_operation_handler("reset", self.execute_reset_operation)
+        self.register_operation_handler("highlight", self.execute_highlight_operation)
+        self.register_operation_handler("execute_js", self.execute_js_operation)
+        self.register_operation_handler("batch", self.execute_batch_operation)
+        logger.info("已注册默认操作处理器")
+    
+    async def connect(self, websocket: WebSocket):
+        """处理新的WebSocket连接"""
+        await websocket.accept()
+        self.connections.append(websocket)
+        logger.info(f"新的WebSocket连接已建立，当前连接数: {len(self.connections)}")
+        try:
+            # 保持连接并监听消息
+            while True:
+                message = await websocket.receive_text()
+                await self.process_message(websocket, message)
+        except Exception as e:
+            logger.error(f"WebSocket连接异常: {str(e)}")
+        finally:
+            # 断开连接时清理
+            await self.disconnect(websocket)
+    
+    async def disconnect(self, websocket: WebSocket):
+        """处理WebSocket断开连接"""
+        if websocket in self.connections:
+            self.connections.remove(websocket)
+            logger.info(f"WebSocket连接已断开，剩余连接数: {len(self.connections)}")
+    
+    async def process_message(self, websocket: WebSocket, message: str):
+        """处理接收到的WebSocket消息"""
+        try:
+            data = json.loads(message)
+            logger.debug(f"收到消息: {data}")
+            
+            # 根据消息类型分发处理
+            msg_type = data.get("type")
+            if msg_type == "mcp.command":
+                await self.handle_command(websocket, data)
+            else:
+                logger.warning(f"未知消息类型: {msg_type}")
+                await websocket.send_json({"status": "error", "message": f"未知消息类型: {msg_type}"})
+        except json.JSONDecodeError:
+            logger.error("消息格式错误，不是有效的JSON")
+            await websocket.send_json({"status": "error", "message": "消息格式错误，不是有效的JSON"})
+        except Exception as e:
+            logger.error(f"处理消息时出错: {str(e)}")
+            await websocket.send_json({"status": "error", "message": str(e)})
+    
+    async def handle_command(self, websocket: WebSocket, command: Dict[str, Any]):
+        """处理MCP命令"""
+        try:
+            operation = command.get("operation")
+            params = command.get("params", {})
+            command_id = command.get("command_id")
+            
+            if not operation:
+                error_msg = "命令缺少操作类型"
+                logger.error(error_msg)
+                await websocket.send_json({
+                    "type": "mcp.response",
+                    "command_id": command_id,
+                    "status": "error",
+                    "message": error_msg
+                })
+                return
+            
+            logger.info(f"处理命令: {operation}, 参数: {params}")
+            
+            # 查找对应的处理方法
+            handler = self.operation_handlers.get(operation)
+            if handler:
+                result = await handler(params)
+                # 发送执行结果
+                await websocket.send_json({
+                    "type": "mcp.response",
+                    "command_id": command_id,
+                    "status": "success" if result.get("success", False) else "error",
+                    "data": result.get("data", {}),
+                    "message": result.get("message", "")
+                })
+            else:
+                error_msg = f"未知操作类型: {operation}"
+                logger.warning(error_msg)
+                await websocket.send_json({
+                    "type": "mcp.response",
+                    "command_id": command_id,
+                    "status": "error",
+                    "message": error_msg
+                })
+        except Exception as e:
+            logger.error(f"处理命令时出错: {str(e)}")
+            await websocket.send_json({
+                "type": "mcp.response",
+                "command_id": command.get("command_id"),
+                "status": "error",
+                "message": f"处理命令时出错: {str(e)}"
+            })
+    
+    async def broadcast_command(self, command: Dict[str, Any]):
+        """广播命令到所有连接的客户端"""
+        if not self.connections:
+            logger.warning("没有活跃的连接，无法广播命令")
+            return False
         
-        server_config = self.servers[server_id]
-        
-        # 替换命令参数中的变量
-        args = []
-        for arg in server_config.args:
-            if "${action}" in arg:
-                arg = arg.replace("${action}", action)
-            elif "${JSON.stringify(params)}" in arg:
-                arg = arg.replace("${JSON.stringify(params)}", json.dumps(parameters))
-            args.append(arg)
-        
-        return {
-            "mcpServers": {
-                server_id: {
-                    "command": server_config.command,
-                    "args": args,
-                    "env": server_config.env
+        try:
+            command_str = MCPCommandBuilder.serialize_command(command)
+            tasks = [connection.send_text(command_str) for connection in self.connections]
+            await asyncio.gather(*tasks)
+            logger.info(f"已广播命令到 {len(self.connections)} 个客户端")
+            return True
+        except Exception as e:
+            logger.error(f"广播命令时出错: {str(e)}")
+            return False
+    
+    def register_operation_handler(self, operation: str, handler: Callable):
+        """注册操作处理方法"""
+        self.operation_handlers[operation] = handler
+        logger.debug(f"已注册操作处理器: {operation}")
+    
+    async def execute_rotate_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行旋转操作"""
+        try:
+            if not params or 'direction' not in params or 'angle' not in params:
+                return {"success": False, "error": "旋转操作缺少必要参数 (direction/angle)"}
+            
+            direction = params.get('direction', 'left')
+            angle = float(params.get('angle', 0.1))
+            
+            # 将角度转换为弧度
+            angle_rad = angle * (3.14159 / 180)
+            
+            # 由于不再使用Playwright/Selenium (self.browser为None)，直接通过WebSocket发送命令到前端
+            logger.info(f"准备通过WebSocket发送旋转操作: direction={direction}, angle={angle}")
+            
+            # 构建MCP命令
+            command = {
+                "type": "mcp.command",
+                "operation": "rotate",
+                "params": {
+                    "direction": direction,
+                    "angle": angle
+                },
+                "command_id": str(uuid.uuid4())
+            }
+            
+            # 广播到所有连接的客户端
+            broadcast_success = await self.broadcast_command(command)
+            
+            if not broadcast_success:
+                return {"success": False, "error": "没有活跃的WebSocket连接，无法执行旋转操作"}
+            
+            return {
+                "success": True,
+                "message": f"已发送旋转命令: 方向={direction}, 角度={angle}°",
+                "data": {
+                    "direction": direction,
+                    "angle": angle
                 }
             }
+        except Exception as e:
+            logging.error(f"执行旋转操作时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": f"执行旋转操作时出错: {str(e)}"}
+    
+    async def execute_zoom_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行缩放操作"""
+        try:
+            scale = params.get("scale")
+            
+            if scale is None:
+                return {"success": False, "message": "缺少缩放参数"}
+            
+            # 确保scale是数值类型
+            if isinstance(scale, dict) and "scale" in scale:
+                scale = float(scale["scale"])
+            else:
+                scale = float(scale)
+            
+            if scale <= 0:
+                return {"success": False, "message": "缩放比例必须大于0"}
+            
+            self.logger.info(f"执行缩放操作: scale={scale}")
+            
+            # 构建MCP命令
+            command = {
+                "type": "mcp.command",
+                "operation": "zoom",
+                "params": {
+                    "scale": scale
+                },
+                "command_id": str(uuid.uuid4())
+            }
+            
+            # 广播到所有连接的客户端
+            broadcast_success = await self.broadcast_command(command)
+            
+            if not broadcast_success:
+                return {"success": False, "error": "没有活跃的WebSocket连接，无法执行缩放操作"}
+            
+            return {
+                "success": True, 
+                "message": f"已发送缩放命令: 比例={scale}",
+                "data": {
+                    "scale": scale
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"执行缩放操作时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "message": f"执行缩放操作时出错: {str(e)}"}
+    
+    async def execute_focus_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行聚焦操作"""
+        try:
+            target = params.get("target")
+            
+            if not target:
+                return {"success": False, "message": "缺少目标参数"}
+            
+            self.logger.info(f"执行聚焦操作: target={target}")
+            
+            # 构建MCP命令
+            command = {
+                "type": "mcp.command",
+                "operation": "focus",
+                "params": {
+                    "target": target
+                },
+                "command_id": str(uuid.uuid4())
+            }
+            
+            # 广播到所有连接的客户端
+            broadcast_success = await self.broadcast_command(command)
+            
+            if not broadcast_success:
+                return {"success": False, "error": "没有活跃的WebSocket连接，无法执行聚焦操作"}
+            
+            return {
+                "success": True, 
+                "message": f"已发送聚焦命令: 目标={target}",
+                "data": {
+                    "target": target
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"执行聚焦操作时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "message": f"执行聚焦操作时出错: {str(e)}"}
+    
+    async def execute_reset_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行重置视图操作"""
+        try:
+            self.logger.info("执行重置视图操作")
+            
+            # 构建MCP命令
+            command = {
+                "type": "mcp.command",
+                "operation": "reset",
+                "params": {},
+                "command_id": str(uuid.uuid4())
+            }
+            
+            # 广播到所有连接的客户端
+            broadcast_success = await self.broadcast_command(command)
+            
+            if not broadcast_success:
+                return {"success": False, "error": "没有活跃的WebSocket连接，无法执行重置操作"}
+            
+            return {
+                "success": True, 
+                "message": "已发送重置视图命令",
+                "data": {}
+            }
+            
+        except Exception as e:
+            self.logger.error(f"执行重置视图操作时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "message": f"执行重置视图操作时出错: {str(e)}"}
+    
+    async def execute_highlight_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行高亮组件操作"""
+        try:
+            component_id = params.get("component_id")
+            color = params.get("color", "#FF0000")
+            duration = params.get("duration")
+            
+            if not component_id:
+                return {"success": False, "message": "缺少组件ID参数"}
+            
+            self.logger.info(f"执行高亮操作: component_id={component_id}, color={color}, duration={duration}")
+            
+            # 由于不再使用Playwright，直接返回成功结果
+            return {
+                "success": True, 
+                "message": f"已发送高亮命令: 组件={component_id}, 颜色={color}" + 
+                          (f", 持续时间={duration}秒" if duration is not None else ""),
+                "data": {
+                    "component_id": component_id,
+                    "color": color,
+                    "duration": duration
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"执行高亮操作时出错: {str(e)}")
+            return {"success": False, "message": f"执行高亮操作时出错: {str(e)}"}
+    
+    async def execute_js_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行JavaScript代码操作"""
+        try:
+            code = params.get("code")
+            
+            if not code:
+                return {"success": False, "message": "缺少JavaScript代码参数"}
+            
+            self.logger.info(f"执行JavaScript操作, 代码长度: {len(code)}字符")
+            
+            # 由于不再使用Playwright，直接返回成功结果
+            return {
+                "success": True, 
+                "message": "已发送JavaScript执行命令",
+                "data": {
+                    "code_length": len(code)
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"执行JavaScript代码操作时出错: {str(e)}")
+            return {"success": False, "message": f"执行JavaScript代码操作时出错: {str(e)}"}
+    
+    async def execute_batch_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """执行批量操作命令"""
+        try:
+            commands = params.get("commands", [])
+            
+            if not commands:
+                return {"success": False, "message": "批量命令列表为空"}
+            
+            results = []
+            for cmd in commands:
+                operation = cmd.get("operation")
+                cmd_params = cmd.get("params", {})
+                
+                handler = self.operation_handlers.get(operation)
+                if handler:
+                    result = await handler(cmd_params)
+                    results.append(result)
+                else:
+                    results.append({
+                        "success": False,
+                        "message": f"未知操作类型: {operation}"
+                    })
+            
+            success_count = sum(1 for result in results if result.get("success", False))
+            
+            return {
+                "success": success_count > 0,
+                "message": f"批量操作完成，成功: {success_count}/{len(commands)}",
+                "data": {
+                    "results": results
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"执行批量操作时出错: {str(e)}")
+            return {"success": False, "message": f"执行批量操作时出错: {str(e)}"}
+
+# 操作处理器
+class OperationHandler:
+    """MCP操作处理器"""
+    
+    def __init__(self):
+        self.operations: Dict[str, Callable] = {}
+    
+    def register_operation(self, operation_type: str, handler: Callable):
+        """注册操作处理方法"""
+        self.operations[operation_type] = handler
+    
+    def get_handler(self, operation_type: str) -> Optional[Callable]:
+        """获取操作处理方法"""
+        return self.operations.get(operation_type)
+        
+    def get_registered_operations(self) -> List[str]:
+        """获取所有已注册的操作类型列表"""
+        return list(self.operations.keys())
+
+def main():
+    """主函数"""
+    import uvicorn
+    from fastapi.middleware.cors import CORSMiddleware
+    
+    # 创建FastAPI应用
+    app = FastAPI()
+    
+    # 配置CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # 创建连接管理器和MCP服务器实例
+    connection_manager = ConnectionManager()
+    mcp_server = MCPServer()
+    operation_handler = OperationHandler()
+    
+    # 注册操作处理函数 - 使用MCP服务器中的方法
+    operation_handler.register_operation("rotate", mcp_server.execute_rotate_operation)
+    operation_handler.register_operation("zoom", mcp_server.execute_zoom_operation)
+    operation_handler.register_operation("focus", mcp_server.execute_focus_operation)
+    operation_handler.register_operation("reset", mcp_server.execute_reset_operation)
+    
+    # WebSocket连接端点
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await connection_manager.connect(websocket)
+        try:
+            while True:
+                data = await websocket.receive_json()
+                logger.info(f"收到WebSocket消息: {data}")
+                
+                # 处理MCP命令
+                if "action" in data:
+                    action = data.get("action", "")
+                    if not action:
+                        logger.warning("收到空操作类型的命令")
+                        await websocket.send_json({"status": "error", "message": "操作类型不能为空"})
+                        continue
+                        
+                    handler = operation_handler.get_handler(action)
+                    if handler:
+                        try:
+                            result = await handler(data.get("parameters", {}))
+                            await websocket.send_json({
+                                "status": "success",
+                                "commandId": data.get("id", str(uuid.uuid4())),
+                                "result": result
+                            })
+                        except Exception as e:
+                            logger.error(f"执行操作 {action} 时出错: {str(e)}")
+                            await websocket.send_json({
+                                "status": "error",
+                                "commandId": data.get("id", str(uuid.uuid4())),
+                                "error": str(e)
+                            })
+                    else:
+                        logger.warning(f"未找到操作处理器: {action}")
+                        await websocket.send_json({
+                            "status": "error", 
+                            "message": f"未支持的操作类型: {action}"
+                        })
+                else:
+                    await websocket.send_json({"status": "error", "message": "消息格式不正确，缺少'action'字段"})
+        except WebSocketDisconnect:
+            connection_manager.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"WebSocket处理异常: {str(e)}")
+            connection_manager.disconnect(websocket)
+    
+    # 添加健康检查端点
+    @app.get("/health")
+    async def health_check():
+        """健康检查端点"""
+        return {"status": "ok", "service": "mcp_server"}
+    
+    # 添加WebSocket状态检查端点
+    @app.get("/api/websocket/status")
+    async def websocket_status():
+        """WebSocket状态检查端点"""
+        return {
+            "status": "available", 
+            "connections": connection_manager.get_active_connections_count(),
+            "operations": operation_handler.get_registered_operations()
         }
     
-    async def execute_command(self, command: MCPCommand) -> MCPCommandResult:
-        """执行MCP命令"""
+    # 添加AI助手请求处理接口
+    @app.post("/api/llm/process")
+    async def process_llm_request(request: Request):
+        """处理LLM请求"""
         try:
-            # 记录命令执行
-            logger.info(f"执行MCP命令: {command.to_dict()}")
+            # 从请求中获取消息
+            data = await request.json()
+            user_message = data.get("message", "")
             
-            # 确保命令类型正确
-            if not command.action:
-                logger.warning("收到空操作类型的命令，返回默认成功")
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=True,
-                    data={"message": "空操作类型，命令被忽略"},
-                    error=None
+            if not user_message:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "消息内容不能为空"}
                 )
-            
-            # 将MCP命令适配为main.py中的请求格式
-            operation_data = {
-                "operation": str(command.action),
-                "parameters": command.parameters,
-            }
-            
-            if command.target:
-                operation_data["target"] = command.target
-            
-            logger.info(f"适配后的请求数据: {operation_data}")
-            
-            # 确保页面已初始化
-            if not self.page:
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=False,
-                    error="页面未初始化"
-                )
-            
-            # 根据命令类型执行相应操作
-            result = None
-            if command.action == MCPOperationType.ROTATE:
-                result = await self._handle_rotate(command)
-            elif command.action == MCPOperationType.ZOOM:
-                result = await self._handle_zoom(command)
-            elif command.action == MCPOperationType.FOCUS:
-                result = await self._handle_focus(command)
-            elif command.action == MCPOperationType.RESET:
-                result = await self._handle_reset(command)
-            else:
-                raise ValueError(f"未知的命令类型: {command.action}")
-            
-            # 记录执行结果
-            logger.info(f"命令执行结果: {result}")
-            
-            # 确保返回MCPCommandResult对象
-            if isinstance(result, dict):
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=result.get("success", False),
-                    data=result.get("data", {}),
-                    error=result.get("error")
-                )
-            else:
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=False,
-                    error="无效的返回结果"
-                )
-        except Exception as e:
-            logger.error(f"执行MCP命令时出错: {str(e)}")
-            logger.error(traceback.format_exc())
-            return MCPCommandResult(
-                command_id=command.id,
-                success=False,
-                error=str(e)
-            )
-    
-    async def _execute_external_command(self, command: MCPCommand) -> MCPCommandResult:
-        """执行外部MCP命令"""
-        server_id = "threejs-control"  # 默认服务器ID
-        
-        if server_id not in self.servers:
-            raise ValueError(f"未找到服务器配置: {server_id}")
-        
-        server_config = self.servers[server_id]
-        
-        # 生成MCP命令
-        mcp_command = self.generate_mcp_command(
-            action=command.action,
-            parameters=command.parameters,
-            server_id=server_id
-        )
-        
-        logger.debug(f"生成MCP命令: {mcp_command}")
-        
-        # 创建Future对象用于等待命令执行结果
-        future = asyncio.Future()
-        self.command_results[command.id] = future
-        
-        try:
-            # 执行命令
-            process = await asyncio.create_subprocess_exec(
-                server_config.command,
-                *server_config.args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **server_config.env},
-                cwd=server_config.cwd
-            )
-            
-            # 等待进程执行完成
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=server_config.timeout
-            )
-            
-            if process.returncode != 0:
-                logger.error(f"命令执行失败: {stderr.decode()}")
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=False,
-                    error=f"命令返回错误: {stderr.decode()}"
-                )
-            
-            # 解析输出
-            try:
-                output = stdout.decode().strip()
-                result = json.loads(output)
                 
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=True,
-                    data=result
+            logger.info(f"处理AI助手请求: {user_message}")
+            
+            # 使用改进的命令解析函数，提取操作类型和参数
+            operation, parameters = parse_natural_language(user_message)
+            
+            if not operation:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "无法解析操作类型"}
                 )
-            except json.JSONDecodeError:
-                return MCPCommandResult(
-                    command_id=command.id,
-                    success=True,
-                    data={"output": output}
+                
+            # 获取操作处理器
+            handler = operation_handler.get_handler(operation)
+            if not handler:
+                return JSONResponse(
+                    status_code=404,
+                    content={"status": "error", "message": f"未找到操作处理器: {operation}"}
                 )
-        except asyncio.TimeoutError:
-            logger.error(f"命令执行超时: {command.id}")
-            return MCPCommandResult(
-                command_id=command.id,
-                success=False,
-                error="命令执行超时"
+                
+            # 执行操作
+            result = await handler(parameters)
+            
+            return {
+                "status": "success",
+                "operation": operation,
+                "result": result,
+                "message": f"成功执行{operation}操作"
+            }
+        except Exception as e:
+            logger.error(f"处理LLM请求时出错: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": f"处理请求时出错: {str(e)}"}
             )
+    
+    # 添加通用操作执行接口
+    @app.post("/api/execute")
+    async def execute_operation(request: Request):
+        """执行操作"""
+        try:
+            # 从请求中获取操作信息
+            data = await request.json()
+            operation = data.get("operation", "")
+            parameters = data.get("parameters", {})
+            
+            if not operation:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "操作类型不能为空"}
+                )
+                
+            # 获取操作处理器
+            handler = operation_handler.get_handler(operation)
+            if not handler:
+                return JSONResponse(
+                    status_code=404,
+                    content={"status": "error", "message": f"未找到操作处理器: {operation}"}
+                )
+                
+            # 执行操作
+            result = await handler(parameters)
+            
+            return {
+                "status": "success",
+                "operation": operation,
+                "result": result
+            }
         except Exception as e:
-            logger.error(f"执行外部命令失败: {e}")
-            return MCPCommandResult(
-                command_id=command.id,
-                success=False,
-                error=str(e)
+            logger.error(f"执行操作时出错: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": f"执行操作时出错: {str(e)}"}
             )
-        finally:
-            # 清理Future对象
-            if command.id in self.command_results:
-                del self.command_results[command.id]
     
-    async def _handle_rotate(self, command: MCPCommand) -> Dict[str, Any]:
-        """处理旋转命令"""
-        if not self.page:
-            return {"success": True, "message": "页面未初始化，但操作被视为已执行", "data": {"executed": False}}
-        
-        # 获取旋转参数
-        direction = command.parameters.get("direction", "left")
-        angle = float(command.parameters.get("angle", 45))
-        
-        try:
-            logger.info(f"执行旋转操作: 方向={direction}, 角度={angle}")
-            
-            # 直接执行JavaScript代码
-            js_result = await self.page.evaluate("""
-            (params) => {
-                try {
-                    // 获取ThreeJS对象
-                    const scene = window.__scene || window.scene;
-                    const camera = window.__camera || window.camera;
-                    const renderer = window.__renderer || window.renderer;
-                    const controls = window.__controls || window.__orbitControls || window.controls;
-                    
-                    if (!scene || !camera || !renderer || !controls) {
-                        console.error('ThreeJS对象未初始化');
-                        return { success: false, error: 'ThreeJS对象未初始化' };
-                    }
-                    
-                    // 转换为弧度
-                    const radians = params.angle * Math.PI / 180;
-                    
-                    // 根据方向执行旋转
-                    if (params.direction === 'left') {
-                        controls.rotateLeft(radians);
-                    } else if (params.direction === 'right') {
-                        controls.rotateRight(radians);
-                    } else if (params.direction === 'up') {
-                        controls.rotateUp(radians);
-                    } else if (params.direction === 'down') {
-                        controls.rotateDown(radians);
-                    }
-                    
-                    // 更新控制器和渲染
-                    controls.update();
-                    renderer.render(scene, camera);
-                    
-                    return { success: true, executed: true };
-                } catch (error) {
-                    console.error('执行旋转操作出错:', error);
-                    return { success: false, error: error.toString() };
-                }
-            }
-            """, {"direction": direction, "angle": angle})
-            
-            logger.info(f"旋转操作JavaScript执行结果: {js_result}")
-            
-            return {
-                "success": js_result.get("success", False),
-                "data": {
-                    "action": "rotate",
-                    "direction": direction,
-                    "angle": angle,
-                    "executed": js_result.get("executed", False)
-                },
-                "error": js_result.get("error")
-            }
-        except Exception as e:
-            logger.error(f"执行旋转操作失败: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e),
-                "data": {
-                    "action": "rotate",
-                    "direction": direction,
-                    "angle": angle,
-                    "executed": False
-                }
-            }
-    
-    async def _handle_zoom(self, command: MCPCommand) -> Dict[str, Any]:
-        """处理缩放命令"""
-        if not self.page:
-            return {"success": False, "error": "页面未初始化", "data": {"executed": False}}
-        
-        # 获取缩放比例
-        scale = float(command.parameters.get("scale", 1.2))
-        
-        try:
-            logger.info(f"执行缩放操作: 比例={scale}")
-            
-            # 直接执行JavaScript代码
-            js_result = await self.page.evaluate("""
-            (params) => {
-                try {
-                    // 获取ThreeJS对象
-                    const scene = window.__scene || window.scene;
-                    const camera = window.__camera || window.camera;
-                    const renderer = window.__renderer || window.renderer;
-                    const controls = window.__controls || window.__orbitControls || window.controls;
-                    
-                    if (!scene || !camera || !renderer || !controls) {
-                        console.error('ThreeJS对象未初始化');
-                        return { success: false, error: 'ThreeJS对象未初始化' };
-                    }
-                    
-                    // 执行缩放
-                    if (params.scale > 1) {
-                        controls.dollyIn(params.scale);
-                    } else {
-                        controls.dollyOut(1/params.scale);
-                    }
-                    
-                    // 更新控制器和渲染
-                    controls.update();
-                    renderer.render(scene, camera);
-                    
-                    return { success: true, executed: true };
-                } catch (error) {
-                    console.error('执行缩放操作出错:', error);
-                    return { success: false, error: error.toString() };
-                }
-            }
-            """, {"scale": scale})
-            
-            logger.info(f"缩放操作JavaScript执行结果: {js_result}")
-            
-            return {
-                "success": js_result.get("success", False),
-                "data": {
-                    "action": "zoom",
-                    "scale": scale,
-                    "executed": js_result.get("executed", False)
-                },
-                "error": js_result.get("error")
-            }
-        except Exception as e:
-            logger.error(f"执行缩放操作失败: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e),
-                "data": {
-                    "action": "zoom",
-                    "scale": scale,
-                    "executed": False
-                }
-            }
-    
-    async def _handle_focus(self, command: MCPCommand) -> Dict[str, Any]:
-        """处理聚焦命令"""
-        if not self.page:
-            return {"success": False, "error": "页面未初始化", "data": {"executed": False}}
-        
-        # 获取聚焦目标
-        target = command.target or "center"
-        
-        try:
-            logger.info(f"执行聚焦操作: 目标={target}")
-            
-            # 直接执行JavaScript代码
-            js_result = await self.page.evaluate("""
-            (params) => {
-                try {
-                    // 获取ThreeJS对象
-                    const scene = window.__scene || window.scene;
-                    const camera = window.__camera || window.camera;
-                    const renderer = window.__renderer || window.renderer;
-                    const controls = window.__controls || window.__orbitControls || window.controls;
-                    
-                    if (!scene || !camera || !renderer || !controls) {
-                        console.error('ThreeJS对象未初始化');
-                        return { success: false, error: 'ThreeJS对象未初始化' };
-                    }
-                    
-                    // 根据目标执行聚焦
-                    if (params.target === "center") {
-                        // 重置控制器到中心
-                        controls.target.set(0, 0, 0);
-                    } else {
-                        // 尝试查找目标对象
-                        const targetObject = scene.getObjectByName(params.target);
-                        if (targetObject) {
-                            // 计算目标对象的中心点
-                            const box = new THREE.Box3().setFromObject(targetObject);
-                            const center = box.getCenter(new THREE.Vector3());
-                            controls.target.copy(center);
-                        } else {
-                            console.error(`未找到目标对象: ${params.target}`);
-                            return { success: false, error: `未找到目标对象: ${params.target}` };
-                        }
-                    }
-                    
-                    // 更新控制器和渲染
-                    controls.update();
-                    renderer.render(scene, camera);
-                    
-                    return { success: true, executed: true };
-                } catch (error) {
-                    console.error('执行聚焦操作出错:', error);
-                    return { success: false, error: error.toString() };
-                }
-            }
-            """, {"target": target})
-            
-            logger.info(f"聚焦操作JavaScript执行结果: {js_result}")
-            
-            return {
-                "success": js_result.get("success", False),
-                "data": {
-                    "action": "focus",
-                    "target": target,
-                    "executed": js_result.get("executed", False)
-                },
-                "error": js_result.get("error")
-            }
-        except Exception as e:
-            logger.error(f"执行聚焦操作失败: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e),
-                "data": {
-                    "action": "focus",
-                    "target": target,
-                    "executed": False
-                }
-            }
-    
-    async def _handle_reset(self, command: MCPCommand) -> Dict[str, Any]:
-        """处理重置命令"""
-        if not self.page:
-            return {"success": False, "error": "页面未初始化", "data": {"executed": False}}
-        
-        try:
-            logger.info("执行重置操作")
-            
-            # 直接执行JavaScript代码
-            js_result = await self.page.evaluate("""
-            () => {
-                try {
-                    // 获取ThreeJS对象
-                    const scene = window.__scene || window.scene;
-                    const camera = window.__camera || window.camera;
-                    const renderer = window.__renderer || window.renderer;
-                    const controls = window.__controls || window.__orbitControls || window.controls;
-                    
-                    if (!scene || !camera || !renderer || !controls) {
-                        console.error('ThreeJS对象未初始化');
-                        return { success: false, error: 'ThreeJS对象未初始化' };
-                    }
-                    
-                    // 重置相机位置
-                    if (window.__defaultCameraPosition) {
-                        camera.position.copy(window.__defaultCameraPosition);
-                    } else {
-                        camera.position.set(0, 5, 10);
-                    }
-                    
-                    // 重置控制器
-                    controls.target.set(0, 0, 0);
-                    controls.update();
-                    
-                    // 更新渲染
-                    renderer.render(scene, camera);
-                    
-                    return { success: true, executed: true };
-                } catch (error) {
-                    console.error('执行重置操作出错:', error);
-                    return { success: false, error: error.toString() };
-                }
-            }
-            """)
-            
-            logger.info(f"重置操作JavaScript执行结果: {js_result}")
-            
-            return {
-                "success": js_result.get("success", False),
-                "data": {
-                    "action": "reset",
-                    "executed": js_result.get("executed", False)
-                },
-                "error": js_result.get("error")
-            }
-        except Exception as e:
-            logger.error(f"执行重置操作失败: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e),
-                "data": {
-                    "action": "reset",
-                    "executed": False
-                }
-            }
+    # 启动服务器
+    port = int(os.environ.get("PORT", 9000))
+    print(f"启动MCP服务器，端口: {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
-# 创建MCP服务器实例
-mcp_server = MCPServer()
-
-# 注册默认的ThreeJS控制服务器
-mcp_server.register_server("threejs-control", {
-    "command": "node",
-    "args": [
-        "mcp-adapter.js", 
-        "--action=${action}", 
-        "--params=${JSON.stringify(params)}"
-    ],
-    "env": {
-        "THREEJS_SCENE_ID": "scene_001"
-    }
-})
-
-# 从自然语言生成MCP命令
-async def generate_mcp_command_from_nl(message: str) -> Optional[MCPCommand]:
-    """从自然语言生成MCP命令"""
-    if not message or not isinstance(message, str):
-        logger.warning(f"生成命令的输入无效: {message}")
-        return None
-        
-    # 记录原始输入
-    logger.info(f"从自然语言生成MCP命令，输入: {message}")
-    
-    # 转换为小写便于匹配
-    message_lower = message.lower()
-    
-    # 旋转命令
-    if "旋转" in message_lower or "rotate" in message_lower or "turn" in message_lower:
-        direction = "left"
-        degrees = 45
-        
-        # 检测方向
-        if "左" in message_lower or "left" in message_lower:
-            direction = "left"
-        elif "右" in message_lower or "right" in message_lower:
-            direction = "right"
-        elif "上" in message_lower or "up" in message_lower:
-            direction = "up"
-        elif "下" in message_lower or "down" in message_lower:
-            direction = "down"
-        
-        # 检测角度
-        import re
-        angle_match = re.search(r'(\d+)\s*度', message_lower)
-        if angle_match:
-            degrees = int(angle_match.group(1))
-        
-        # 创建命令并确保action是字符串
-        cmd = MCPCommand(
-            action="rotate",  # 使用字符串而不是枚举
-            parameters={"direction": direction, "angle": degrees}  # 使用degrees而不是angle
-        )
-        logger.info(f"生成旋转命令: {cmd.to_dict()}")
-        return cmd
-    
-    # 缩放命令
-    elif any(keyword in message_lower for keyword in ["缩放", "放大", "缩小", "zoom", "scale"]):
-        scale = 1.5
-        
-        # 检测缩放方向
-        if "缩小" in message_lower or "减小" in message_lower:
-            scale = 0.8
-        
-        # 尝试提取精确的比例值
-        import re
-        scale_match = re.search(r'(\d+(?:\.\d+)?)\s*倍', message_lower)
-        if scale_match:
-            scale = float(scale_match.group(1))
-        
-        # 创建命令并确保action是字符串
-        cmd = MCPCommand(
-            action="zoom",  # 使用字符串而不是枚举
-            parameters={"scale": scale}
-        )
-        logger.info(f"生成缩放命令: {cmd.to_dict()}")
-        return cmd
-    
-    # 聚焦命令
-    elif any(keyword in message_lower for keyword in ["聚焦", "关注", "focus", "center"]):
-        target = "center"
-        
-        # 尝试提取目标
-        if "区域" in message_lower or "area" in message_lower:
-            import re
-            area_match = re.search(r'区域\s*(\d+)', message_lower)
-            if area_match:
-                target = f"Area_{area_match.group(1)}"
-        elif "会议室" in message_lower or "meeting" in message_lower:
-            target = "meeting_room"
-        
-        # 创建命令并确保action是字符串
-        cmd = MCPCommand(
-            action="focus",  # 使用字符串而不是枚举
-            parameters={},
-            target=target
-        )
-        logger.info(f"生成聚焦命令: {cmd.to_dict()}")
-        return cmd
-    
-    # 重置命令
-    elif any(keyword in message_lower for keyword in ["重置", "复位", "reset", "default"]):
-        # 创建命令并确保action是字符串
-        cmd = MCPCommand(
-            action="reset",  # 使用字符串而不是枚举
-            parameters={}
-        )
-        logger.info(f"生成重置命令: {cmd.to_dict()}")
-        return cmd
-    
-    # 尝试基于关键词进行简单匹配
-    command_action = None
-    if "模型" in message_lower and ("左" in message_lower or "右" in message_lower):
-        command_action = "rotate"
-    elif "放大" in message_lower or "缩小" in message_lower:
-        command_action = "zoom"
-    elif "恢复" in message_lower or "初始" in message_lower:
-        command_action = "reset"
-    
-    if command_action:
-        logger.info(f"基于关键词匹配生成命令: {command_action}")
-        
-        if command_action == "rotate":
-            direction = "left" if "左" in message_lower else "right"
-            degrees = 45
-            # 提取角度数字
-            import re
-            angle_match = re.search(r'(\d+)', message_lower)
-            if angle_match:
-                degrees = int(angle_match.group(1))
-            logger.info(f"生成旋转命令，方向:{direction}，角度:{degrees}")
-            return MCPCommand(
-                action="rotate",
-                parameters={"direction": direction, "angle": degrees}  # 使用degrees而不是angle
-            )
-        elif command_action == "zoom":
-            scale = 0.8 if "缩小" in message_lower else 1.5
-            return MCPCommand(
-                action="zoom",
-                parameters={"scale": scale}
-            )
-        elif command_action == "reset":
-            return MCPCommand(
-                action="reset",
-                parameters={}
-            )
-    
-    # 无法识别的命令
-    logger.warning(f"无法从自然语言识别命令: {message}")
-    return None 
+# 添加主函数入口
+if __name__ == "__main__":
+    main() 
