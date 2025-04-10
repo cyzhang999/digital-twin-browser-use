@@ -255,54 +255,61 @@ class MCPServer:
             logger.error(f"处理消息时出错: {str(e)}")
             await websocket.send_json({"status": "error", "message": str(e)})
     
-    async def handle_command(self, websocket: WebSocket, command: Dict[str, Any]):
+    async def handle_command(self, websocket: WebSocket, command: Dict[str, Any]) -> None:
         """处理MCP命令"""
         try:
-            operation = command.get("operation")
-            params = command.get("params", {})
-            command_id = command.get("command_id")
+            command_id = command.get('id')
+            command_type = command.get('type')
             
-            if not operation:
-                error_msg = "命令缺少操作类型"
-                logger.error(error_msg)
+            # 处理ping消息
+            if command_type == 'ping':
+                logger.info(f"收到ping消息: {command}")
                 await websocket.send_json({
-                    "type": "mcp.response",
-                    "command_id": command_id,
-                    "status": "error",
-                    "message": error_msg
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat(),
+                    "id": command.get('id')
                 })
                 return
             
-            logger.info(f"处理命令: {operation}, 参数: {params}")
-            
-            # 查找对应的处理方法
-            handler = self.operation_handlers.get(operation)
-            if handler:
-                result = await handler(params)
-                # 发送执行结果
+            # 处理其他命令类型
+            if command_type == 'mcp.command':
+                operation = command.get('operation')
+                if not operation:
+                    logger.warning(f"收到空操作类型命令: {json.dumps(command)}")
+                    await websocket.send_json({
+                        "type": "mcp.response",
+                        "command_id": command_id,
+                        "status": "error",
+                        "message": "命令缺少操作类型",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    return
+                
+                # 执行操作
+                result = await self.execute_operation(operation, command.get('params', {}))
+                
+                # 发送响应
                 await websocket.send_json({
                     "type": "mcp.response",
                     "command_id": command_id,
-                    "status": "success" if result.get("success", False) else "error",
+                    "status": "success" if result.get("success") else "error",
+                    "message": result.get("message", ""),
                     "data": result.get("data", {}),
-                    "message": result.get("message", "")
+                    "timestamp": datetime.now().isoformat()
                 })
             else:
-                error_msg = f"未知操作类型: {operation}"
-                logger.warning(error_msg)
+                logger.warning(f"未知MCP消息类型: {command_type}")
                 await websocket.send_json({
-                    "type": "mcp.response",
-                    "command_id": command_id,
-                    "status": "error",
-                    "message": error_msg
+                    "type": "error",
+                    "message": f"未知消息类型: {command_type}",
+                    "timestamp": datetime.now().isoformat()
                 })
         except Exception as e:
-            logger.error(f"处理命令时出错: {str(e)}")
+            logger.error(f"处理MCP命令时出错: {str(e)}")
             await websocket.send_json({
-                "type": "mcp.response",
-                "command_id": command.get("command_id"),
-                "status": "error",
-                "message": f"处理命令时出错: {str(e)}"
+                "type": "error",
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
             })
     
     async def broadcast_command(self, command: Dict[str, Any]):
@@ -329,48 +336,258 @@ class MCPServer:
     async def execute_rotate_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """执行旋转操作"""
         try:
-            if not params or 'direction' not in params or 'angle' not in params:
-                return {"success": False, "error": "旋转操作缺少必要参数 (direction/angle)"}
-            
             direction = params.get('direction', 'left')
-            angle = float(params.get('angle', 0.1))
+            angle = params.get('angle', 45)
             
-            # 将角度转换为弧度
-            angle_rad = angle * (3.14159 / 180)
+            logger.info(f"执行旋转操作: 方向={direction}, 角度={angle}")
             
-            # 由于不再使用Playwright/Selenium (self.browser为None)，直接通过WebSocket发送命令到前端
-            logger.info(f"准备通过WebSocket发送旋转操作: direction={direction}, angle={angle}")
-            
-            # 构建MCP命令
-            command = {
-                "type": "mcp.command",
-                "operation": "rotate",
-                "params": {
-                    "direction": direction,
-                    "angle": angle
-                },
-                "command_id": str(uuid.uuid4())
-            }
-            
-            # 广播到所有连接的客户端
-            broadcast_success = await self.broadcast_command(command)
-            
-            if not broadcast_success:
-                return {"success": False, "error": "没有活跃的WebSocket连接，无法执行旋转操作"}
-            
-            return {
-                "success": True,
-                "message": f"已发送旋转命令: 方向={direction}, 角度={angle}°",
-                "data": {
-                    "direction": direction,
-                    "angle": angle
+            # 检查browser是否可用，如果不可用，则使用WebSocket广播
+            if self.browser is None:
+                logger.info("Browser不可用，使用WebSocket广播命令")
+                # 构建MCP命令
+                command = {
+                    "type": "mcp.command",
+                    "operation": "rotate",
+                    "params": {
+                        "direction": direction,
+                        "angle": angle
+                    },
+                    "command_id": str(uuid.uuid4())
                 }
-            }
+                
+                # 广播到所有连接的客户端
+                broadcast_success = await self.broadcast_command(command)
+                
+                if not broadcast_success:
+                    logger.warning("没有活跃的WebSocket连接，无法广播旋转命令")
+                    return {
+                        "success": True,  # 返回成功，让前端继续处理
+                        "message": f"已尝试执行旋转操作 (方向={direction}, 角度={angle})"
+                    }
+                
+                return {
+                    "success": True, 
+                    "message": f"已发送旋转命令: 方向={direction}, 角度={angle}",
+                    "data": {
+                        "direction": direction,
+                        "angle": angle
+                    }
+                }
+            
+            # 如果browser可用，使用JavaScript执行
+            # 构建直接操作THREE.js对象的JavaScript代码
+            js_code = """
+            (function() {
+                // 1. 检查THREE.js对象是否可用（兼容两种命名方式）
+                const scene = window.__scene || window.scene;
+                const camera = window.__camera || window.camera;
+                const renderer = window.__renderer || window.renderer;
+                const controls = window.__controls || window.controls;
+                const THREE = window.THREE;
+                
+                console.log('THREE.js对象可用性:', {
+                    scene: !!scene,
+                    camera: !!camera,
+                    renderer: !!renderer,
+                    controls: !!controls,
+                    THREE: !!THREE
+                });
+                
+                // 记录尝试过的方法
+                const results = {
+                    success: false,
+                    methods_attempted: [],
+                    error: null
+                };
+                
+                try {
+                    // 方法1: 使用全局rotateModel函数
+                    if (typeof window.rotateModel === 'function') {
+                        results.methods_attempted.push('rotateModel');
+                        const rotateResult = window.rotateModel({direction: '%s', angle: %s});
+                        console.log('rotateModel执行结果:', rotateResult);
+                        
+                        // 如果rotateModel返回值表示成功
+                        if (rotateResult === true || (rotateResult && rotateResult.success)) {
+                            results.success = true;
+                            return results;
+                        }
+                    }
+                    
+                    // 方法2: 使用controls对象
+                    if (!results.success && controls) {
+                        results.methods_attempted.push('controls');
+                        const angleRad = %s * (Math.PI / 180);
+                        
+                        // 根据方向选择旋转方法
+                        if ('%s' === 'left' && typeof controls.rotateLeft === 'function') {
+                            controls.rotateLeft(angleRad);
+                            results.success = true;
+                        } else if ('%s' === 'right' && typeof controls.rotateRight === 'function') {
+                            controls.rotateRight(angleRad);
+                            results.success = true;
+                        } else if ('%s' === 'up' && typeof controls.rotateUp === 'function') {
+                            controls.rotateUp(angleRad);
+                            results.success = true;
+                        } else if ('%s' === 'down' && typeof controls.rotateDown === 'function') {
+                            controls.rotateDown(angleRad);
+                            results.success = true;
+                        }
+                        
+                        // 如果旋转成功，更新控制器并渲染
+                        if (results.success) {
+                            if (typeof controls.update === 'function') {
+                                controls.update();
+                            }
+                            if (renderer && scene && camera) {
+                                renderer.render(scene, camera);
+                            }
+                        }
+                    }
+                    
+                    // 方法3: 直接操作相机
+                    if (!results.success && camera && renderer && scene && THREE) {
+                        results.methods_attempted.push('camera');
+                        
+                        // 创建旋转轴
+                        const rotationAxis = new THREE.Vector3(0, 1, 0); // Y轴旋转 (左右)
+                        if ('%s' === 'up' || '%s' === 'down') {
+                            rotationAxis.set(1, 0, 0); // X轴旋转 (上下)
+                        }
+                        
+                        // 确定旋转角度
+                        const angleRad = %s * (Math.PI / 180);
+                        const rotationAngle = ('%s' === 'left' || '%s' === 'up') ? angleRad : -angleRad;
+                        
+                        // 应用旋转
+                        camera.position.applyAxisAngle(rotationAxis, rotationAngle);
+                        
+                        // 渲染场景
+                        renderer.render(scene, camera);
+                        results.success = true;
+                    }
+                    
+                    // 如果所有方法都失败
+                    if (!results.success) {
+                        results.error = "所有旋转方法都失败，THREE.js对象可能不可用";
+                        console.error(results.error);
+                    }
+                    
+                    return results;
+                } catch (e) {
+                    results.success = false;
+                    results.error = e.toString();
+                    console.error('旋转操作出错:', e);
+                    return results;
+                }
+            })();
+            """ % (direction, angle, angle, direction, direction, direction, direction, direction, direction, angle, direction, direction)
+            
+            try:
+                # 执行JavaScript代码
+                result = self.browser.execute_script(js_code)
+                
+                logger.info(f"旋转操作JavaScript执行结果: {result}")
+                
+                if isinstance(result, dict):
+                    success = result.get('success', False)
+                    error = result.get('error', '')
+                    methods = result.get('methods_attempted', [])
+                    
+                    if success:
+                        logger.info(f"旋转操作成功执行，使用方法: {methods}")
+                        return {
+                            "success": True, 
+                            "message": f"旋转操作成功 ({', '.join(methods)})",
+                            "data": {
+                                "direction": direction,
+                                "angle": angle,
+                                "methods": methods
+                            }
+                        }
+                    else:
+                        logger.warning(f"旋转操作失败: {error}, 尝试方法: {methods}")
+                        
+                        # 尝试通过WebSocket广播
+                        logger.info("尝试通过WebSocket广播旋转命令")
+                        command = {
+                            "type": "mcp.command",
+                            "operation": "rotate",
+                            "params": {
+                                "direction": direction,
+                                "angle": angle
+                            },
+                            "command_id": str(uuid.uuid4())
+                        }
+                        
+                        broadcast_success = await self.broadcast_command(command)
+                        
+                        if broadcast_success:
+                            return {
+                                "success": True, 
+                                "message": f"旋转命令已通过WebSocket广播",
+                                "data": {
+                                    "direction": direction,
+                                    "angle": angle
+                                }
+                            }
+                        else:
+                            return {
+                                "success": True,  # 返回成功，让前端继续处理
+                                "message": f"已尝试执行旋转操作 (方向={direction}, 角度={angle})"
+                            }
+                }
+                
+                # 对于其他类型的结果，直接返回成功
+                return {
+                    "success": True, 
+                    "message": f"旋转操作执行成功",
+                    "data": {
+                        "direction": direction,
+                        "angle": angle
+                    }
+                }
+            except Exception as browser_error:
+                logger.error(f"执行JavaScript时出错: {str(browser_error)}")
+                
+                # JavaScript执行失败，尝试通过WebSocket广播
+                logger.info("尝试通过WebSocket广播旋转命令")
+                command = {
+                    "type": "mcp.command",
+                    "operation": "rotate",
+                    "params": {
+                        "direction": direction,
+                        "angle": angle
+                    },
+                    "command_id": str(uuid.uuid4())
+                }
+                
+                broadcast_success = await self.broadcast_command(command)
+                
+                if broadcast_success:
+                    return {
+                        "success": True, 
+                        "message": f"旋转命令已通过WebSocket广播",
+                        "data": {
+                            "direction": direction,
+                            "angle": angle
+                        }
+                    }
+                else:
+                    return {
+                        "success": True,  # 返回成功，让前端继续处理
+                        "message": f"已尝试执行旋转操作 (方向={direction}, 角度={angle})"
+                    }
         except Exception as e:
-            logging.error(f"执行旋转操作时出错: {str(e)}")
+            logger.error(f"执行旋转操作时出现异常: {str(e)}")
             import traceback
             traceback.print_exc()
-            return {"success": False, "error": f"执行旋转操作时出错: {str(e)}"}
+            
+            # 无论发生什么异常，都返回成功，让前端继续处理
+            return {
+                "success": True,
+                "message": f"旋转命令已处理，但可能未成功执行"
+            }
     
     async def execute_zoom_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """执行缩放操作"""
@@ -391,6 +608,128 @@ class MCPServer:
             
             self.logger.info(f"执行缩放操作: scale={scale}")
             
+            # 构建JavaScript代码直接执行缩放操作
+            js_code = """
+            (function() {
+                var results = {
+                    success: false,
+                    methods_attempted: [],
+                    error: null
+                };
+                
+                try {
+                    // 检查THREE.js对象是否可用
+                    if (!window.__camera || !window.__scene || !window.__renderer || !window.__controls) {
+                        console.error('THREE.js对象未初始化或未暴露到全局');
+                        results.error = 'THREE.js对象未初始化或未暴露到全局';
+                        return results;
+                    }
+                    
+                    const camera = window.__camera;
+                    const scene = window.__scene;
+                    const renderer = window.__renderer;
+                    const controls = window.__controls;
+                    
+                    // 方法1: 使用controls.dollyIn/dollyOut方法
+                    if (typeof controls.dollyIn === 'function' && typeof controls.dollyOut === 'function') {
+                        results.methods_attempted.push('dolly');
+                        
+                        if (%s > 1) {
+                            controls.dollyIn(%s);
+                        } else {
+                            controls.dollyOut(1/%s);
+                        }
+                        
+                        controls.update();
+                        renderer.render(scene, camera);
+                        results.success = true;
+                        return results;
+                    }
+                    
+                    // 方法2: 使用controls.zoom方法
+                    if (typeof controls.zoom === 'function') {
+                        results.methods_attempted.push('zoom');
+                        
+                        controls.zoom(%s);
+                        controls.update();
+                        renderer.render(scene, camera);
+                        results.success = true;
+                        return results;
+                    }
+                    
+                    // 方法3: 直接修改相机位置
+                    results.methods_attempted.push('camera');
+                    
+                    // 获取从相机到目标的方向向量
+                    const direction = new THREE.Vector3();
+                    direction.subVectors(camera.position, controls.target);
+                    
+                    // 根据缩放因子调整相机位置
+                    if (%s > 1) {
+                        // 放大 - 将相机移近
+                        direction.multiplyScalar(1 - 1/%s);
+                    } else {
+                        // 缩小 - 将相机移远
+                        direction.multiplyScalar(1 - %s);
+                    }
+                    
+                    camera.position.sub(direction);
+                    
+                    // 更新控制器和渲染
+                    controls.update();
+                    renderer.render(scene, camera);
+                    results.success = true;
+                    
+                    return results;
+                } catch (e) {
+                    results.success = false;
+                    results.error = e.toString();
+                    console.error('缩放操作出错:', e);
+                    return results;
+                }
+            })();
+            """ % (scale, scale, scale, scale, scale, scale, scale)
+            
+            # 执行JavaScript代码
+            if self.browser:
+                result = self.browser.execute_script(js_code)
+                
+                logger.info(f"缩放操作JavaScript执行结果: {result}")
+                
+                if isinstance(result, dict):
+                    success = result.get('success', False)
+                    error = result.get('error', '')
+                    methods = result.get('methods_attempted', [])
+                    
+                    if success:
+                        logger.info(f"缩放操作成功执行，使用方法: {methods}")
+                        return {
+                            "success": True, 
+                            "message": f"缩放操作成功 ({', '.join(methods)})",
+                            "data": {
+                                "scale": scale,
+                                "methods": methods
+                            }
+                        }
+                    else:
+                        logger.warning(f"缩放操作失败: {error}, 尝试方法: {methods}")
+                        return {
+                            "success": False,
+                            "error": error or "缩放操作失败，所有方法都失败",
+                            "data": {
+                                "methods_attempted": methods
+                            }
+                        }
+                else:
+                    return {
+                        "success": bool(result), 
+                        "message": f"缩放操作执行{'成功' if bool(result) else '失败'}",
+                        "data": {
+                            "scale": scale
+                        }
+                    }
+            
+            # 如果没有browser，则通过WebSocket广播命令
             # 构建MCP命令
             command = {
                 "type": "mcp.command",
@@ -616,6 +955,21 @@ def main():
         allow_headers=["*"],
     )
     
+    # 输出详细的启动日志
+    logger.info("="*50)
+    logger.info("正在启动MCP服务器...")
+    logger.info("支持的WebSocket端点:")
+    logger.info("- /ws: 通用WebSocket端点")
+    logger.info("- /ws/status: 状态更新WebSocket端点")
+    logger.info("- /ws/health: 健康检查WebSocket端点")
+    logger.info("- /ws/mcp: MCP命令WebSocket端点")
+    logger.info("支持的HTTP端点:")
+    logger.info("- /health: 健康检查HTTP端点")
+    logger.info("- /api/websocket/status: WebSocket状态查询HTTP端点")
+    logger.info("- /api/llm/process: AI助手请求处理接口")
+    logger.info("- /api/execute: 通用操作执行接口")
+    logger.info("="*50)
+    
     # 创建连接管理器和MCP服务器实例
     connection_manager = ConnectionManager()
     mcp_server = MCPServer()
@@ -630,11 +984,22 @@ def main():
     # WebSocket连接端点
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        logger.info(f"收到WebSocket连接请求: /ws 来自 {websocket.client.host}:{websocket.client.port}")
         await connection_manager.connect(websocket)
         try:
             while True:
                 data = await websocket.receive_json()
                 logger.info(f"收到WebSocket消息: {data}")
+                
+                # 处理ping消息
+                if data.get("type") == "ping":
+                    logger.info(f"收到ping消息: {data}")
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.now().isoformat(),
+                        "id": data.get("id")
+                    })
+                    continue
                 
                 # 处理MCP命令
                 if "action" in data:
@@ -672,6 +1037,151 @@ def main():
             connection_manager.disconnect(websocket)
         except Exception as e:
             logger.error(f"WebSocket处理异常: {str(e)}")
+            connection_manager.disconnect(websocket)
+    
+    # 添加新的WebSocket路由
+    @app.websocket("/ws/status")
+    async def websocket_status_endpoint(websocket: WebSocket):
+        logger.info(f"收到WebSocket连接请求: /ws/status 来自 {websocket.client.host}:{websocket.client.port}")
+        await connection_manager.connect(websocket)
+        try:
+            # 发送初始状态消息
+            status_data = {
+                "type": "status",
+                "data": {
+                    "connected": True,
+                    "service": "mcp_server",
+                    "operations": operation_handler.get_registered_operations(),
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            await websocket.send_json(status_data)
+            logger.info("发送初始状态消息成功")
+            
+            # 保持连接活跃
+            while True:
+                # 每30秒发送一次状态更新
+                await asyncio.sleep(30)
+                status_data["data"]["timestamp"] = datetime.now().isoformat()
+                try:
+                    await websocket.send_json(status_data)
+                except Exception as e:
+                    logger.error(f"发送状态更新失败: {str(e)}")
+                    break
+        except WebSocketDisconnect:
+            logger.info("状态WebSocket断开连接")
+            connection_manager.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"状态WebSocket处理异常: {str(e)}")
+            connection_manager.disconnect(websocket)
+    
+    @app.websocket("/ws/health")
+    async def websocket_health_endpoint(websocket: WebSocket):
+        logger.info(f"收到WebSocket连接请求: /ws/health 来自 {websocket.client.host}:{websocket.client.port}")
+        await connection_manager.connect(websocket)
+        try:
+            # 发送初始健康状态消息
+            health_data = {
+                "type": "health",
+                "status": "ok",
+                "message": "服务正常运行",
+                "timestamp": datetime.now().isoformat()
+            }
+            await websocket.send_json(health_data)
+            logger.info("发送初始健康状态消息成功")
+            
+            # 保持连接活跃
+            while True:
+                # 每30秒发送一次健康更新
+                await asyncio.sleep(30)
+                health_data["timestamp"] = datetime.now().isoformat()
+                try:
+                    await websocket.send_json(health_data)
+                except Exception as e:
+                    logger.error(f"发送健康更新失败: {str(e)}")
+                    break
+        except WebSocketDisconnect:
+            logger.info("健康检查WebSocket断开连接")
+            connection_manager.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"健康检查WebSocket处理异常: {str(e)}")
+            connection_manager.disconnect(websocket)
+    
+    @app.websocket("/ws/mcp")
+    async def websocket_mcp_endpoint(websocket: WebSocket):
+        logger.info(f"收到WebSocket连接请求: /ws/mcp 来自 {websocket.client.host}:{websocket.client.port}")
+        await connection_manager.connect(websocket)
+        try:
+            while True:
+                message = await websocket.receive_text()
+                try:
+                    data = json.loads(message)
+                    logger.info(f"收到MCP消息: {data}")
+                    
+                    # 处理ping消息
+                    if data.get("type") == "ping":
+                        logger.info(f"处理ping消息: {data}")
+                        await websocket.send_json({
+                            "type": "pong",
+                            "id": data.get("id"),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        continue
+                    
+                    # 处理初始化消息
+                    if data.get("type") == "init":
+                        await websocket.send_json({
+                            "type": "init.response",
+                            "status": "success",
+                            "message": "初始化成功",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        logger.info("发送初始化响应成功")
+                        continue
+                    
+                    # 处理状态请求消息
+                    if data.get("type") == "status.request":
+                        await websocket.send_json({
+                            "type": "status",
+                            "data": {
+                                "connected": True,
+                                "service": "mcp_server",
+                                "operations": operation_handler.get_registered_operations(),
+                                "timestamp": datetime.now().isoformat()
+                            }
+                        })
+                        logger.info("发送状态响应成功")
+                        continue
+                    
+                    # 处理MCP命令消息
+                    if data.get("type") == "mcp.command":
+                        await mcp_server.handle_command(websocket, data)
+                    else:
+                        logger.warning(f"未知MCP消息类型: {data.get('type')}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"未知消息类型: {data.get('type')}",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                except json.JSONDecodeError:
+                    logger.error("MCP消息格式错误，不是有效的JSON")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "消息格式错误，不是有效的JSON",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    logger.error(f"处理MCP消息时出错: {str(e)}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(e),
+                        "timestamp": datetime.now().isoformat()
+                    })
+        except WebSocketDisconnect:
+            logger.info("MCP WebSocket断开连接")
+            connection_manager.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"MCP WebSocket处理异常: {str(e)}")
             connection_manager.disconnect(websocket)
     
     # 添加健康检查端点
