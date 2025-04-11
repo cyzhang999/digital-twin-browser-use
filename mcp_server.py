@@ -23,6 +23,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from mcp_command_builder import MCPCommandBuilder
 from parse_natural_language import parse_natural_language
+import random
+import string
+import hashlib
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -150,45 +153,264 @@ class ConnectionManager:
     """WebSocket连接管理器"""
 
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        # 使用字典存储连接，键为客户端ID
+        self.active_connections = {}
+        # 按端点类型分类存储连接
+        self.endpoint_connections = {
+            "status": {},
+            "health": {},
+            "command": {},
+            "general": {}
+        }
 
-    async def connect(self, websocket: WebSocket):
-        """处理WebSocket连接"""
+    async def connect(self, websocket: WebSocket, endpoint_type="general", client_id=None):
+        """处理WebSocket连接
+        
+        Args:
+            websocket: WebSocket连接对象
+            endpoint_type: 连接端点类型 (status/health/command/general)
+            client_id: 客户端ID，如果为None则自动生成
+        """
         await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"客户端连接成功，当前连接数: {len(self.active_connections)}")
+        
+        # 从请求头中提取会话标识
+        try:
+            # 尝试从cookie或其他自定义头获取会话ID
+            cookies = websocket.headers.get("cookie", "")
+            user_agent = websocket.headers.get("user-agent", "")
+            session_id = ""
+            
+            # 从cookie中提取会话ID
+            if "digital_twin_session_id" in cookies:
+                cookie_parts = cookies.split(";")
+                for part in cookie_parts:
+                    if "digital_twin_session_id" in part:
+                        session_id = part.split("=")[1].strip()
+                        break
+            
+            # 如果从WebSocket消息中得到会话ID，优先使用它
+            try:
+                first_message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+                if isinstance(first_message, dict) and "sessionId" in first_message:
+                    session_id = first_message["sessionId"]
+                    logger.info(f"从WebSocket消息中获取会话ID: {session_id}")
+                    # 发送确认消息
+                    await websocket.send_json({
+                        "type": "session_confirm", 
+                        "sessionId": session_id,
+                        "timestamp": datetime.now().isoformat()
+                    })
+            except (asyncio.TimeoutError, json.JSONDecodeError):
+                # 忽略超时和解析错误
+                pass
+            
+            # 如果没有会话ID，使用其他方式生成一个稳定标识
+            if not session_id:
+                # 使用用户代理的哈希作为备用
+                if user_agent:
+                    session_id = hashlib.md5(user_agent.encode()).hexdigest()[:8]
+                else:
+                    # 最后使用随机ID
+                    session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        
+        except Exception as e:
+            logger.error(f"提取会话标识时出错: {e}")
+            session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        
+        # 生成客户端ID（格式：HOST_SESSION）
+        if not client_id:
+            client_id = f"{websocket.client.host}_{session_id}"
+        
+        # 检查是否存在同一客户端的同类端点连接
+        for existing_id, existing_conn in list(self.active_connections.items()):
+            # 只有当有相同的会话ID和相同的端点类型时，才视为重复连接
+            if existing_id != client_id and existing_conn["endpoint_type"] == endpoint_type:
+                existing_session_id = existing_id.split('_')[1] if '_' in existing_id else ""
+                if existing_session_id == session_id:
+                    try:
+                        logger.info(f"发现同一会话的重复连接，断开旧连接: {existing_id}")
+                        # 发送断开消息
+                        await existing_conn["websocket"].send_json({
+                            "type": "close", 
+                            "reason": "duplicate_connection",
+                            "message": "已在其他位置建立新连接",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        await existing_conn["websocket"].close(code=1000, reason="重复连接")
+                    except Exception as e:
+                        logger.error(f"关闭重复连接时出错: {e}")
+                    finally:
+                        self.disconnect(existing_conn["websocket"], existing_id)
+        
+        # 保存连接
+        self.active_connections[client_id] = {
+            "websocket": websocket,
+            "endpoint_type": endpoint_type,
+            "connected_at": datetime.now(),
+            "last_activity": datetime.now(),
+            "session_id": session_id
+        }
+        
+        # 按端点类型分类
+        if endpoint_type not in self.endpoint_connections:
+            self.endpoint_connections[endpoint_type] = {}
+        self.endpoint_connections[endpoint_type][client_id] = websocket
+        
+        logger.info(f"客户端[{client_id}]连接成功，端点类型：{endpoint_type}，当前连接数: {len(self.active_connections)}")
+        
+        return client_id
 
-    def disconnect(self, websocket: WebSocket):
+    def disconnect(self, websocket: WebSocket, client_id=None):
         """处理WebSocket断开连接"""
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-            logger.info(f"客户端断开连接，当前连接数: {len(self.active_connections)}")
-
-    async def broadcast(self, message: Dict[str, Any]):
-        """广播消息到所有连接的客户端"""
-        if not self.active_connections:
-            logger.warning("没有活跃的WebSocket连接，无法广播消息")
+        # 如果提供了客户端ID，直接使用它
+        if client_id and client_id in self.active_connections:
+            # 获取端点类型
+            endpoint_type = self.active_connections[client_id]["endpoint_type"]
+            # 从特定端点类型的字典中移除
+            if endpoint_type in self.endpoint_connections:
+                if client_id in self.endpoint_connections[endpoint_type]:
+                    del self.endpoint_connections[endpoint_type][client_id]
+            # 从总连接字典中移除
+            del self.active_connections[client_id]
+            logger.info(f"客户端[{client_id}]断开连接，当前连接数: {len(self.active_connections)}")
             return
+        
+        # 如果没有提供客户端ID，则搜索匹配的WebSocket
+        to_remove = []
+        for cid, conn_info in self.active_connections.items():
+            if conn_info["websocket"] == websocket:
+                to_remove.append(cid)
+                # 获取端点类型
+                endpoint_type = conn_info["endpoint_type"]
+                # 从特定端点类型的字典中移除
+                if endpoint_type in self.endpoint_connections and cid in self.endpoint_connections[endpoint_type]:
+                    del self.endpoint_connections[endpoint_type][cid]
+        
+        # 从总连接字典中移除
+        for cid in to_remove:
+            del self.active_connections[cid]
+            logger.info(f"客户端[{cid}]断开连接，当前连接数: {len(self.active_connections)}")
 
+    async def broadcast(self, message: Dict[str, Any], endpoint_type=None, exclude_client_id=None):
+        """广播消息到指定类型的所有连接的客户端
+        
+        Args:
+            message: 要广播的消息
+            endpoint_type: 要广播到的端点类型，如果为None则广播到所有端点
+            exclude_client_id: 要排除的客户端ID
+        """
+        # 确定要广播的连接列表
+        target_connections = {}
+        
+        if endpoint_type and endpoint_type in self.endpoint_connections:
+            target_connections = self.endpoint_connections[endpoint_type]
+        else:
+            # 如果没有指定端点类型，则向所有连接广播
+            for ep_type, connections in self.endpoint_connections.items():
+                target_connections.update(connections)
+        
+        if not target_connections:
+            logger.warning(f"没有活跃的WebSocket连接[端点类型:{endpoint_type}]，无法广播消息")
+            return False
+        
         disconnected_clients = []
-
-        for websocket in self.active_connections:
+        success_count = 0
+        
+        for cid, websocket in list(target_connections.items()):
+            # 排除指定的客户端
+            if exclude_client_id and cid == exclude_client_id:
+                continue
+                
             try:
                 await websocket.send_json(message)
+                success_count += 1
             except Exception as e:
-                logger.error(f"广播消息失败: {e}")
-                disconnected_clients.append(websocket)
-
+                logger.error(f"向客户端[{cid}]广播消息失败: {e}")
+                disconnected_clients.append(cid)
+        
         # 清理断开的连接
-        for websocket in disconnected_clients:
-            self.disconnect(websocket)
+        for cid in disconnected_clients:
+            if endpoint_type and endpoint_type in self.endpoint_connections and cid in self.endpoint_connections[endpoint_type]:
+                del self.endpoint_connections[endpoint_type][cid]
+            if cid in self.active_connections:
+                del self.active_connections[cid]
+        
+        if success_count > 0:
+            logger.info(f"成功广播消息到 {success_count} 个客户端[端点类型:{endpoint_type}]")
+            return True
+        else:
+            logger.warning(f"没有客户端接收到广播消息[端点类型:{endpoint_type}]")
+            return False
+
+    async def send_to_client(self, client_id: str, message: Dict[str, Any]) -> bool:
+        """向特定客户端发送消息"""
+        if client_id not in self.active_connections:
+            logger.warning(f"客户端[{client_id}]不存在，无法发送消息")
+            return False
+        
+        try:
+            websocket = self.active_connections[client_id]["websocket"]
+            await websocket.send_json(message)
+            logger.info(f"成功向客户端[{client_id}]发送消息")
+            return True
+        except Exception as e:
+            logger.error(f"向客户端[{client_id}]发送消息失败: {e}")
+            # 可能连接已断开，移除该连接
+            self.disconnect(None, client_id)
+            return False
 
     async def send_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+        """发送文本消息到特定WebSocket"""
+        try:
+            await websocket.send_text(message)
+            return True
+        except Exception as e:
+            logger.error(f"发送文本消息失败: {e}")
+            return False
 
-    def get_active_connections_count(self) -> int:
+    def get_client_by_websocket(self, websocket: WebSocket) -> Optional[str]:
+        """根据WebSocket对象获取客户端ID"""
+        # 先尝试使用ConnectionManager的方法
+        for client_id, conn_info in self.active_connections.items():
+            if conn_info["websocket"] == websocket:
+                return client_id
+        
+        # 作为备用，获取客户端的host和port信息
+        client_address = f"{websocket.client.host}"
+        # 尝试查找以此地址开头的客户端
+        active_clients = self.get_active_clients()
+        for active_id in active_clients:
+            if active_id.startswith(client_address):
+                return active_id
+        
+        # 如果都找不到，创建一个临时ID并注册
+        temp_id = f"{websocket.client.host}_{uuid.uuid4().hex[:8]}"
+        logger.info(f"为WebSocket创建临时客户端ID: {temp_id}")
+        
+        # 在返回临时ID之前，确保它被注册到连接管理器
+        try:
+            # 异步注册连接
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.connect(websocket, endpoint_type="command", client_id=temp_id))
+            else:
+                loop.run_until_complete(self.connect(websocket, endpoint_type="command", client_id=temp_id))
+        except Exception as e:
+            logger.warning(f"注册临时客户端ID时出错: {e}")
+        
+        return temp_id
+
+    def get_active_connections_count(self, endpoint_type=None) -> int:
         """获取当前活跃的WebSocket连接数"""
+        if endpoint_type and endpoint_type in self.endpoint_connections:
+            return len(self.endpoint_connections[endpoint_type])
         return len(self.active_connections)
+
+    def get_active_clients(self, endpoint_type=None) -> List[str]:
+        """获取活跃客户端ID列表"""
+        if endpoint_type and endpoint_type in self.endpoint_connections:
+            return list(self.endpoint_connections[endpoint_type].keys())
+        return list(self.active_connections.keys())
 
 
 # MCP服务器实现
@@ -200,26 +422,41 @@ class MCPServer:
     """
 
     def __init__(self):
-        self.connections: List[WebSocket] = []
-        self.operation_handlers: Dict[str, Callable] = {}
-        # 初始化logger
-        self.logger = logger
-        # 初始化browser属性为None
-        self.browser = None
-        # 注册默认操作处理器
+        """初始化MCP服务器"""
+        # 创建操作处理器注册表
+        self.operation_handlers = OperationHandler()
+        
+        # 注册基本操作处理器
         self._register_default_handlers()
-        self.logger.info("MCP服务器初始化完成")
+        
+        # 连接和消息处理相关变量
+        self.pending_messages = {}
+        self.browser_control = None
+        self.browser = None  # 确保browser属性存在
+        self.logger = logger  # 添加logger引用以便在执行方法中使用
+        self.connection_manager = None  # 会在main函数中设置
+        
+        # 初始状态
+        self.status = {
+            "server": "online",
+            "browser": "offline",
+            "operations": self.operation_handlers.get_registered_operations()
+        }
+        
+        logger.info(f"MCP服务器已初始化，支持的操作: {self.operation_handlers.get_registered_operations()}")
 
     def _register_default_handlers(self):
-        """注册默认的操作处理方法"""
-        self.register_operation_handler("rotate", self.execute_rotate_operation)
-        self.register_operation_handler("zoom", self.execute_zoom_operation)
-        self.register_operation_handler("focus", self.execute_focus_operation)
-        self.register_operation_handler("reset", self.execute_reset_operation)
-        self.register_operation_handler("highlight", self.execute_highlight_operation)
-        self.register_operation_handler("execute_js", self.execute_js_operation)
-        self.register_operation_handler("batch", self.execute_batch_operation)
-        logger.info("已注册默认操作处理器")
+        """注册默认操作处理器"""
+        # 注册基本操作
+        self.operation_handlers.register_operation(MCPOperationType.ROTATE, self.execute_rotate_operation)
+        self.operation_handlers.register_operation(MCPOperationType.ZOOM, self.execute_zoom_operation)
+        self.operation_handlers.register_operation(MCPOperationType.FOCUS, self.execute_focus_operation)
+        self.operation_handlers.register_operation(MCPOperationType.RESET, self.execute_reset_operation)
+        
+        # 注册其他操作
+        self.operation_handlers.register_operation("highlight", self.execute_highlight_operation)
+        self.operation_handlers.register_operation("execute_js", self.execute_js_operation)
+        self.operation_handlers.register_operation("batch", self.execute_batch_operation)
 
     async def connect(self, websocket: WebSocket):
         """处理新的WebSocket连接"""
@@ -263,27 +500,42 @@ class MCPServer:
             logger.error(f"处理消息时出错: {str(e)}")
             await websocket.send_json({"status": "error", "message": str(e)})
 
-    async def handle_command(self, websocket: WebSocket, command: Dict[str, Any]) -> None:
-        """处理MCP命令"""
+    async def handle_command(self, websocket: WebSocket, command_data: Dict[str, Any]) -> None:
+        """处理MCP命令
+
+        Args:
+            websocket: WebSocket连接
+            command_data: 命令数据
+        """
         try:
-            command_id = command.get('id')
-            command_type = command.get('type')
-
-            # 处理ping消息
-            if command_type == 'ping':
-                logger.info(f"收到ping消息: {command}")
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.now().isoformat(),
-                    "id": command.get('id')
-                })
-                return
-
-            # 处理其他命令类型
-            if command_type == 'mcp.command':
-                operation = command.get('operation')
-                if not operation:
-                    logger.warning(f"收到空操作类型命令: {json.dumps(command)}")
+            # 提取命令ID，首先检查顶层，然后检查嵌套命令
+            command_id = command_data.get("id") or command_data.get("command_id") or str(uuid.uuid4())
+            
+            # 检查命令格式并规范化
+            if "command" in command_data and isinstance(command_data["command"], dict):
+                # 处理嵌套命令 - 将嵌套命令提取到顶层
+                nested_command = command_data["command"]
+                # 保留顶层ID，但使用嵌套命令的其他字段
+                action = nested_command.get("action")
+                parameters = nested_command.get("parameters", {})
+                target = nested_command.get("target")
+            else:
+                # 直接使用顶层字段
+                action = command_data.get("action")
+                parameters = command_data.get("parameters", {})
+                target = command_data.get("target")
+            
+            # 检查操作类型
+            if not action:
+                # 尝试从"type"字段获取操作类型（有些客户端可能使用type而非action）
+                action = command_data.get("type")
+                if action == "mcp.command":
+                    # 如果类型是mcp.command但没有具体操作，尝试从其他字段推断
+                    action = command_data.get("operation")
+                
+                # 如果仍然没有操作类型，报错
+                if not action:
+                    logger.warning(f"收到空操作类型命令: {json.dumps(command_data)}")
                     await websocket.send_json({
                         "type": "mcp.response",
                         "command_id": command_id,
@@ -292,48 +544,124 @@ class MCPServer:
                         "timestamp": datetime.now().isoformat()
                     })
                     return
-
-                # 执行操作
-                result = await self.execute_operation(operation, command.get('params', {}))
-
-                # 发送响应
-                await websocket.send_json({
+            
+            # 获取客户端ID
+            client_id = None
+            try:
+                client_id = connection_manager.get_client_by_websocket(websocket)
+            except Exception as e:
+                logger.warning(f"获取客户端ID时出错: {e}")
+                
+            if not client_id:
+                # 创建临时客户端ID
+                client_id = f"{websocket.client.host}_{uuid.uuid4().hex[:8]}"
+                logger.info(f"创建临时客户端ID: {client_id}")
+                
+                # 异步注册客户端ID
+                try:
+                    await connection_manager.connect(websocket, endpoint_type="command", client_id=client_id)
+                    logger.info(f"临时客户端[{client_id}]已注册")
+                except Exception as e:
+                    logger.warning(f"注册临时客户端ID时出错，继续处理命令: {e}")
+            
+            # 添加通用参数
+            if isinstance(parameters, dict):
+                parameters["client_id"] = client_id
+            
+            # 查找操作处理器
+            handler = self.operation_handlers.get_handler(action)
+            if not handler:
+                logger.warning(f"未找到处理器: {action}")
+                # 尝试执行特定的内置方法
+                method_name = f"execute_{action}_operation"
+                if hasattr(self, method_name) and callable(getattr(self, method_name)):
+                    handler = getattr(self, method_name)
+                    logger.info(f"使用内置方法处理器: {method_name}")
+                else:
+                    await websocket.send_json({
+                        "type": "mcp.response",
+                        "command_id": command_id,
+                        "status": "error",
+                        "message": f"未找到操作处理器: {action}",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    return
+            
+            # 执行操作
+            logger.info(f"执行{action}操作: 参数={parameters}")
+            result = await handler(parameters)
+            
+            # 构建响应
+            if isinstance(result, dict):
+                success = result.get("success", False)
+                response = {
                     "type": "mcp.response",
                     "command_id": command_id,
-                    "status": "success" if result.get("success") else "error",
-                    "message": result.get("message", ""),
-                    "data": result.get("data", {}),
+                    "status": "success" if success else "error",
+                    "action": action,
+                    "result": result,
+                    "message": result.get("message", f"{'成功' if success else '失败'}执行{action}操作"),
                     "timestamp": datetime.now().isoformat()
-                })
+                }
             else:
-                logger.warning(f"未知MCP消息类型: {command_type}")
+                # 如果结果不是字典，构建一个标准响应
+                response = {
+                    "type": "mcp.response",
+                    "command_id": command_id,
+                    "status": "success",
+                    "action": action,
+                    "result": {"data": result},
+                    "message": f"已执行{action}操作",
+                    "timestamp": datetime.now().isoformat()
+                }
+            
+            # 发送响应
+            await websocket.send_json(response)
+            logger.info(f"已向客户端[{client_id}]发送操作响应")
+        except Exception as e:
+            logger.exception(f"处理命令时出错: {e}")
+            try:
+                # 尝试发送错误响应
                 await websocket.send_json({
-                    "type": "error",
-                    "message": f"未知消息类型: {command_type}",
+                    "type": "mcp.response",
+                    "command_id": command_data.get("id", str(uuid.uuid4())),
+                    "status": "error",
+                    "message": f"处理命令时出错: {str(e)}",
                     "timestamp": datetime.now().isoformat()
                 })
-        except Exception as e:
-            logger.error(f"处理MCP命令时出错: {str(e)}")
-            await websocket.send_json({
-                "type": "error",
-                "message": str(e),
-                "timestamp": datetime.now().isoformat()
-            })
+            except:
+                logger.error("无法发送错误响应")
+                pass
 
     async def broadcast_command(self, command: Dict[str, Any]):
         """广播命令到所有连接的客户端"""
-        if not self.connections:
-            logger.warning("没有活跃的连接，无法广播命令")
-            return False
-
         try:
-            command_str = MCPCommandBuilder.serialize_command(command)
-            tasks = [connection.send_text(command_str) for connection in self.connections]
-            await asyncio.gather(*tasks)
-            logger.info(f"已广播命令到 {len(self.connections)} 个客户端")
-            return True
+            # 使用全局的connection_manager广播命令
+            command_str = json.dumps(command)
+            global connection_manager
+            
+            # 检查connection_manager是否可用
+            if not 'connection_manager' in globals():
+                logger.warning("全局connection_manager不存在，无法广播命令")
+                return False
+                
+            # 向command端点广播命令
+            broadcast_success = await connection_manager.broadcast(command, endpoint_type="command")
+            
+            if not broadcast_success:
+                # 尝试向所有端点广播
+                broadcast_success = await connection_manager.broadcast(command, endpoint_type=None)
+                
+            if broadcast_success:
+                logger.info(f"已成功广播命令")
+                return True
+            else:
+                logger.warning("没有客户端接收到命令广播")
+                return False
         except Exception as e:
             logger.error(f"广播命令时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def register_operation_handler(self, operation: str, handler: Callable):
@@ -364,23 +692,25 @@ class MCPServer:
                 }
 
                 # 广播到所有连接的客户端
-                broadcast_success = await self.broadcast_command(command)
-
-                if not broadcast_success:
-                    logger.warning("没有活跃的WebSocket连接，无法广播旋转命令")
-                    return {
-                        "success": True,  # 返回成功，让前端继续处理
-                        "message": f"已尝试执行旋转操作 (方向={direction}, 角度={angle})"
-                    }
-
-                return {
-                    "success": True,
-                    "message": f"已发送旋转命令: 方向={direction}, 角度={angle}",
-                    "data": {
-                        "direction": direction,
-                        "angle": angle
-                    }
-                }
+                if self.connection_manager:
+                    broadcast_success = await self.connection_manager.broadcast(command, endpoint_type="command")
+                    
+                    if broadcast_success:
+                        return {
+                            "success": True,
+                            "message": f"已发送旋转命令: 方向={direction}, 角度={angle}",
+                            "data": {
+                                "direction": direction,
+                                "angle": angle
+                            }
+                        }
+                    else:
+                        logger.warning("没有活跃的WebSocket连接，无法广播旋转命令")
+                else:
+                    broadcast_success = await self.broadcast_command(command)
+                    
+                    if not broadcast_success:
+                        logger.warning("没有活跃的WebSocket连接，无法广播旋转命令")
 
             # 如果browser可用，使用JavaScript执行
             # 构建直接操作THREE.js对象的JavaScript代码
@@ -632,22 +962,24 @@ class MCPServer:
                 }
 
                 # 广播到所有连接的客户端
-                broadcast_success = await self.broadcast_command(command)
-
-                if not broadcast_success:
-                    logger.warning("没有活跃的WebSocket连接，无法广播缩放命令")
-                    return {
-                        "success": True,  # 返回成功，让前端继续处理
-                        "message": f"已尝试执行缩放操作 (比例={scale})"
-                    }
-
-                return {
-                    "success": True,
-                    "message": f"已发送缩放命令: 比例={scale}",
-                    "data": {
-                        "scale": scale
-                    }
-                }
+                if self.connection_manager:
+                    broadcast_success = await self.connection_manager.broadcast(command, endpoint_type="command")
+                    
+                    if broadcast_success:
+                        return {
+                            "success": True,
+                            "message": f"已发送缩放命令: 比例={scale}",
+                            "data": {
+                                "scale": scale
+                            }
+                        }
+                    else:
+                        logger.warning("没有活跃的WebSocket连接，无法广播缩放命令")
+                else:
+                    broadcast_success = await self.broadcast_command(command)
+                    
+                    if not broadcast_success:
+                        logger.warning("没有活跃的WebSocket连接，无法广播缩放命令")
 
             # 如果browser可用，使用JavaScript执行
             # 构建JavaScript代码直接执行缩放操作
@@ -970,7 +1302,7 @@ class MCPServer:
                 operation = cmd.get("operation")
                 cmd_params = cmd.get("params", {})
 
-                handler = self.operation_handlers.get(operation)
+                handler = self.operation_handlers.get_handler(operation)
                 if handler:
                     result = await handler(cmd_params)
                     results.append(result)
@@ -993,6 +1325,90 @@ class MCPServer:
         except Exception as e:
             logger.error(f"执行批量操作时出错: {str(e)}")
             return {"success": False, "message": f"执行批量操作时出错: {str(e)}"}
+
+    async def handle_generic_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """处理通用命令，尝试从不同格式中提取操作类型和参数
+
+        Args:
+            command: 命令数据
+
+        Returns:
+            命令执行结果
+        """
+        try:
+            # 首先尝试提取操作类型
+            action = None
+            parameters = {}
+            
+            # 检查各种可能的字段名
+            if "action" in command:
+                action = command["action"]
+                parameters = command.get("parameters", {})
+            elif "operation" in command:
+                action = command["operation"]
+                parameters = command.get("parameters", {}) or command.get("params", {})
+            elif "type" in command and command["type"] != "mcp.command":
+                # 如果type不是mcp.command，可能是直接操作类型
+                action = command["type"]
+                parameters = command.get("data", {}) or command.get("parameters", {}) or command.get("params", {})
+            
+            # 检查嵌套命令
+            if not action and "command" in command and isinstance(command["command"], dict):
+                nested = command["command"]
+                if "action" in nested:
+                    action = nested["action"]
+                    parameters = nested.get("parameters", {})
+                elif "operation" in nested:
+                    action = nested["operation"]
+                    parameters = nested.get("parameters", {}) or nested.get("params", {})
+            
+            # 如果仍然没有找到操作类型，返回错误
+            if not action:
+                return {
+                    "success": False,
+                    "message": "无法从命令中提取操作类型",
+                    "data": {}
+                }
+            
+            # 查找操作处理器
+            handler = self.operation_handlers.get_handler(action)
+            if not handler:
+                logger.warning(f"未找到处理器: {action}")
+                # 尝试执行特定的内置方法
+                method_name = f"execute_{action}_operation"
+                if hasattr(self, method_name) and callable(getattr(self, method_name)):
+                    handler = getattr(self, method_name)
+                    logger.info(f"使用内置方法处理器: {method_name}")
+                else:
+                    return {
+                        "success": False,
+                        "message": f"未找到操作处理器: {action}",
+                        "data": {}
+                    }
+            
+            # 执行操作
+            logger.info(f"通用命令处理 - 执行{action}操作: 参数={parameters}")
+            result = await handler(parameters)
+            
+            # 确保返回标准格式
+            if isinstance(result, dict):
+                if "success" not in result:
+                    result["success"] = True
+                return result
+            else:
+                # 如果结果不是字典，包装为标准格式
+                return {
+                    "success": True,
+                    "message": f"成功执行{action}操作",
+                    "data": result if result is not None else {}
+                }
+        except Exception as e:
+            logger.exception(f"处理通用命令时出错: {e}")
+            return {
+                "success": False,
+                "message": f"处理命令时出错: {str(e)}",
+                "data": {}
+            }
 
 
 # 操作处理器
@@ -1048,8 +1464,13 @@ def main():
     logger.info("=" * 50)
 
     # 创建连接管理器和MCP服务器实例
+    global connection_manager
     connection_manager = ConnectionManager()
     mcp_server = MCPServer()
+    
+    # 让MCP服务器能够访问connection_manager
+    mcp_server.connection_manager = connection_manager
+    
     operation_handler = OperationHandler()
 
     # 注册操作处理函数 - 使用MCP服务器中的方法
@@ -1061,161 +1482,230 @@ def main():
     # WebSocket连接端点
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
+        """通用WebSocket端点"""
         logger.info(f"收到WebSocket连接请求: /ws 来自 {websocket.client.host}:{websocket.client.port}")
-        await connection_manager.connect(websocket)
+        client_id = await connection_manager.connect(websocket, endpoint_type="general")
+        
         try:
+            # 发送欢迎消息
+            await websocket.send_json({
+                "type": "welcome",
+                "message": "已连接到MCP服务器",
+                "client_id": client_id,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # 循环处理消息
             while True:
-                data = await websocket.receive_json()
-                logger.info(f"收到WebSocket消息: {data}")
-
-                # 处理ping消息
-                if data.get("type") == "ping":
-                    logger.info(f"收到ping消息: {data}")
-                    await websocket.send_json({
-                        "type": "pong",
-                        "timestamp": datetime.now().isoformat(),
-                        "id": data.get("id")
-                    })
-                    continue
-
-                # 处理MCP命令
-                if "action" in data:
-                    action = data.get("action", "")
-                    if not action:
-                        logger.warning("收到空操作类型的命令")
-                        await websocket.send_json({"status": "error", "message": "操作类型不能为空"})
-                        continue
-
-                    handler = operation_handler.get_handler(action)
-                    if handler:
-                        try:
-                            result = await handler(data.get("parameters", {}))
-                            await websocket.send_json({
-                                "status": "success",
-                                "commandId": data.get("id", str(uuid.uuid4())),
-                                "result": result
-                            })
-                        except Exception as e:
-                            logger.error(f"执行操作 {action} 时出错: {str(e)}")
-                            await websocket.send_json({
-                                "status": "error",
-                                "commandId": data.get("id", str(uuid.uuid4())),
-                                "error": str(e)
-                            })
-                    else:
-                        logger.warning(f"未找到操作处理器: {action}")
+                message = await websocket.receive_text()
+                
+                try:
+                    data = json.loads(message)
+                    logger.info(f"收到客户端[{client_id}]的消息: {data}")
+                    
+                    # 处理不同类型的消息
+                    msg_type = data.get("type", "unknown")
+                    
+                    if msg_type == "ping":
                         await websocket.send_json({
-                            "status": "error",
-                            "message": f"未支持的操作类型: {action}"
+                            "type": "pong",
+                            "timestamp": datetime.now().isoformat()
                         })
-                else:
-                    await websocket.send_json({"status": "error", "message": "消息格式不正确，缺少'action'字段"})
+                    elif msg_type == "command":
+                        # 转发给命令处理器
+                        result = await mcp_server.handle_generic_command(data.get("command", {}))
+                        await websocket.send_json({
+                            "type": "command_result",
+                            "success": result.get("success", False),
+                            "message": result.get("message", ""),
+                            "data": result.get("data", {}),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"未知消息类型: {msg_type}",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                except json.JSONDecodeError:
+                    logger.error(f"客户端[{client_id}]发送的不是有效的JSON")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "消息格式无效，需要JSON格式",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    logger.error(f"处理客户端[{client_id}]消息时出错: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"处理消息时出错: {e}",
+                        "timestamp": datetime.now().isoformat()
+                    })
         except WebSocketDisconnect:
-            connection_manager.disconnect(websocket)
+            logger.info(f"客户端[{client_id}]断开WebSocket连接")
         except Exception as e:
-            logger.error(f"WebSocket处理异常: {str(e)}")
-            connection_manager.disconnect(websocket)
+            logger.error(f"WebSocket连接错误: {e}")
+        finally:
+            connection_manager.disconnect(websocket, client_id)
 
-    # 添加新的WebSocket路由
     @app.websocket("/ws/status")
     async def websocket_status_endpoint(websocket: WebSocket):
+        """状态WebSocket端点"""
         logger.info(f"收到WebSocket连接请求: /ws/status 来自 {websocket.client.host}:{websocket.client.port}")
-        await connection_manager.connect(websocket)
+        
+        # 提取或生成会话ID
+        session_id = websocket.query_params.get("sessionId", None)
+        if not session_id:
+            # 尝试从cookie中提取
+            cookies = websocket.headers.get("cookie", "")
+            if "digital_twin_session_id" in cookies:
+                cookie_parts = cookies.split(";")
+                for part in cookie_parts:
+                    if "digital_twin_session_id" in part:
+                        session_id = part.split("=")[1].strip()
+                        break
+        
+        # 连接到ConnectionManager
+        client_id = await connection_manager.connect(websocket, endpoint_type="status")
+        
         try:
-            # 发送初始状态消息
+            # 发送初始状态
             status_data = {
                 "type": "status",
                 "data": {
                     "connected": True,
+                    "client_id": client_id,
                     "service": "mcp_server",
-                    "operations": operation_handler.get_registered_operations(),
+                    "version": "1.0.0",
                     "timestamp": datetime.now().isoformat()
                 }
             }
             await websocket.send_json(status_data)
             logger.info("发送初始状态消息成功")
-
-            # 保持连接活跃
+            
+            # 循环等待消息
             while True:
-                # 每30秒发送一次状态更新
-                await asyncio.sleep(30)
-                status_data["data"]["timestamp"] = datetime.now().isoformat()
                 try:
-                    await websocket.send_json(status_data)
+                    message = await websocket.receive_text()
+                    
+                    # 更新最后活动时间
+                    if client_id in connection_manager.active_connections:
+                        connection_manager.active_connections[client_id]["last_activity"] = datetime.now()
+                    
+                    # 处理心跳和状态请求
+                    try:
+                        data = json.loads(message)
+                        
+                        if isinstance(data, dict):
+                            if data.get("type") == "heartbeat":
+                                # 心跳响应
+                                await websocket.send_json({
+                                    "type": "heartbeat_response",
+                                    "timestamp": datetime.now().isoformat(),
+                                    "status": "ok"
+                                })
+                            elif data.get("type") == "status.request":
+                                # 状态请求响应
+                                await websocket.send_json({
+                                    "type": "status",
+                                    "data": {
+                                        "connected": True,
+                                        "client_id": client_id,
+                                        "service": "mcp_server",
+                                        "version": "1.0.0",
+                                        "connections": connection_manager.get_active_connections_count(),
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                })
+                                logger.info("发送状态响应成功")
+                    except json.JSONDecodeError:
+                        logger.warning(f"非JSON格式状态消息: {message}")
+                except WebSocketDisconnect:
+                    logger.info(f"客户端[{client_id}]断开状态WebSocket连接")
+                    break
                 except Exception as e:
-                    logger.error(f"发送状态更新失败: {str(e)}")
+                    logger.error(f"处理状态WebSocket消息时出错: {str(e)}")
                     break
         except WebSocketDisconnect:
-            logger.info("状态WebSocket断开连接")
-            connection_manager.disconnect(websocket)
+            logger.info(f"客户端[{client_id}]断开状态WebSocket连接")
         except Exception as e:
-            logger.error(f"状态WebSocket处理异常: {str(e)}")
-            connection_manager.disconnect(websocket)
+            logger.error(f"状态WebSocket连接出错: {str(e)}")
+        finally:
+            connection_manager.disconnect(websocket, client_id)
 
     @app.websocket("/ws/health")
     async def websocket_health_endpoint(websocket: WebSocket):
+        """健康检查WebSocket端点"""
         logger.info(f"收到WebSocket连接请求: /ws/health 来自 {websocket.client.host}:{websocket.client.port}")
-        await connection_manager.connect(websocket)
+        client_id = await connection_manager.connect(websocket, endpoint_type="health")
+        
         try:
-            # 发送初始健康状态消息
+            # 发送初始健康状态
             health_data = {
                 "type": "health",
-                "status": "ok",
-                "message": "服务正常运行",
+                "status": "healthy",
+                "client_id": client_id,
+                "browser_status": "正常",
+                "message": "服务正常运行中",
                 "timestamp": datetime.now().isoformat()
             }
             await websocket.send_json(health_data)
             logger.info("发送初始健康状态消息成功")
-
-            # 保持连接活跃
+            
+            # 循环等待消息
             while True:
-                # 每30秒发送一次健康更新
-                await asyncio.sleep(30)
-                health_data["timestamp"] = datetime.now().isoformat()
+                message = await websocket.receive_text()
                 try:
-                    await websocket.send_json(health_data)
+                    data = json.loads(message)
+                    logger.info(f"收到健康检查消息: {data}")
+                    
+                    # 处理健康检查请求
+                    if data.get("type") == "health.check":
+                        await websocket.send_json({
+                            "type": "health",
+                            "status": "healthy",
+                            "client_id": client_id,
+                            "browser_status": "正常",
+                            "message": "服务正常运行中",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        logger.info("发送健康状态响应成功")
+                    else:
+                        logger.warning(f"未知健康检查消息类型: {data.get('type')}")
                 except Exception as e:
-                    logger.error(f"发送健康更新失败: {str(e)}")
-                    break
+                    logger.error(f"处理健康检查消息时出错: {e}")
         except WebSocketDisconnect:
-            logger.info("健康检查WebSocket断开连接")
-            connection_manager.disconnect(websocket)
+            logger.info(f"客户端[{client_id}]断开健康检查WebSocket连接")
         except Exception as e:
-            logger.error(f"健康检查WebSocket处理异常: {str(e)}")
-            connection_manager.disconnect(websocket)
+            logger.error(f"健康检查WebSocket连接错误: {e}")
+        finally:
+            connection_manager.disconnect(websocket, client_id)
 
     @app.websocket("/ws/mcp")
     async def websocket_mcp_endpoint(websocket: WebSocket):
+        """MCP WebSocket端点"""
         logger.info(f"收到WebSocket连接请求: /ws/mcp 来自 {websocket.client.host}:{websocket.client.port}")
-        await connection_manager.connect(websocket)
+        client_id = await connection_manager.connect(websocket, endpoint_type="command")
+        
         try:
             while True:
                 message = await websocket.receive_text()
                 try:
                     data = json.loads(message)
                     logger.info(f"收到MCP消息: {data}")
-
-                    # 处理ping消息
-                    if data.get("type") == "ping":
-                        logger.info(f"处理ping消息: {data}")
-                        await websocket.send_json({
-                            "type": "pong",
-                            "id": data.get("id"),
-                            "timestamp": datetime.now().isoformat()
-                        })
-                        continue
-
+                    
                     # 处理初始化消息
                     if data.get("type") == "init":
                         await websocket.send_json({
                             "type": "init.response",
                             "status": "success",
                             "message": "初始化成功",
+                            "client_id": client_id,
                             "timestamp": datetime.now().isoformat()
                         })
                         logger.info("发送初始化响应成功")
                         continue
-
+                    
                     # 处理状态请求消息
                     if data.get("type") == "status.request":
                         await websocket.send_json({
@@ -1223,13 +1713,14 @@ def main():
                             "data": {
                                 "connected": True,
                                 "service": "mcp_server",
+                                "client_id": client_id,
                                 "operations": operation_handler.get_registered_operations(),
                                 "timestamp": datetime.now().isoformat()
                             }
                         })
                         logger.info("发送状态响应成功")
                         continue
-
+                    
                     # 处理MCP命令消息
                     if data.get("type") == "mcp.command":
                         await mcp_server.handle_command(websocket, data)
@@ -1241,25 +1732,25 @@ def main():
                             "timestamp": datetime.now().isoformat()
                         })
                 except json.JSONDecodeError:
-                    logger.error("MCP消息格式错误，不是有效的JSON")
+                    logger.error(f"非JSON格式的MCP消息: {message}")
                     await websocket.send_json({
                         "type": "error",
-                        "message": "消息格式错误，不是有效的JSON",
+                        "message": "消息格式无效，需要JSON格式",
                         "timestamp": datetime.now().isoformat()
                     })
                 except Exception as e:
-                    logger.error(f"处理MCP消息时出错: {str(e)}")
+                    logger.error(f"处理MCP消息时出错: {e}")
                     await websocket.send_json({
                         "type": "error",
-                        "message": str(e),
+                        "message": f"处理消息时出错: {e}",
                         "timestamp": datetime.now().isoformat()
                     })
         except WebSocketDisconnect:
-            logger.info("MCP WebSocket断开连接")
-            connection_manager.disconnect(websocket)
+            logger.info(f"MCP WebSocket断开连接")
+            connection_manager.disconnect(websocket, client_id)
         except Exception as e:
-            logger.error(f"MCP WebSocket处理异常: {str(e)}")
-            connection_manager.disconnect(websocket)
+            logger.error(f"MCP WebSocket连接错误: {e}")
+            connection_manager.disconnect(websocket, client_id)
 
     # 添加健康检查端点
     @app.get("/health")
@@ -1365,6 +1856,128 @@ def main():
                 status_code=500,
                 content={"status": "error", "message": f"执行操作时出错: {str(e)}"}
             )
+
+    @app.websocket("/ws/command")
+    async def websocket_command_endpoint(websocket: WebSocket):
+        """命令WebSocket端点"""
+        logger.info(f"收到WebSocket连接请求: /ws/command 来自 {websocket.client.host}:{websocket.client.port}")
+        
+        # 提取或生成会话ID
+        session_id = websocket.query_params.get("sessionId", None)
+        if not session_id:
+            # 尝试从cookie中提取
+            cookies = websocket.headers.get("cookie", "")
+            if "digital_twin_session_id" in cookies:
+                cookie_parts = cookies.split(";")
+                for part in cookie_parts:
+                    if "digital_twin_session_id" in part:
+                        session_id = part.split("=")[1].strip()
+                        break
+        
+        # 连接到ConnectionManager
+        client_id = await connection_manager.connect(websocket, endpoint_type="command")
+        
+        # 发送欢迎消息
+        await websocket.send_json({
+            "type": "welcome",
+            "message": "已连接到MCP命令服务",
+            "client_id": client_id,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        try:
+            # 循环处理消息
+            while True:
+                try:
+                    # 接收消息
+                    message = await websocket.receive_text()
+                    
+                    # 更新最后活动时间
+                    if client_id in connection_manager.active_connections:
+                        connection_manager.active_connections[client_id]["last_activity"] = datetime.now()
+                    
+                    # 解析JSON消息
+                    try:
+                        data = json.loads(message)
+                        
+                        # 处理心跳消息
+                        if isinstance(data, dict) and data.get("type") == "heartbeat":
+                            await websocket.send_json({
+                                "type": "heartbeat_response",
+                                "timestamp": datetime.now().isoformat(),
+                                "status": "ok"
+                            })
+                            continue
+                        
+                        logger.info(f"收到客户端[{client_id}]的命令消息: {data}")
+                        
+                        # 处理不同类型的命令
+                        if isinstance(data, dict):
+                            # 检查命令格式
+                            if data.get("type") == "mcp.command":
+                                # 处理顶层命令
+                                if "action" in data:
+                                    # 直接处理顶层命令
+                                    await mcp_server.handle_command(websocket, data)
+                                elif "command" in data and isinstance(data["command"], dict):
+                                    # 处理嵌套命令
+                                    await mcp_server.handle_command(websocket, data)
+                                else:
+                                    # 缺少必要字段
+                                    logger.warning(f"命令缺少action或command字段: {data}")
+                                    await websocket.send_json({
+                                        "type": "mcp.response",
+                                        "command_id": data.get("id", str(uuid.uuid4())),
+                                        "status": "error",
+                                        "message": "命令缺少action或command字段",
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                            elif "action" in data:
+                                # 直接处理带action字段的命令
+                                await mcp_server.handle_command(websocket, data)
+                            else:
+                                # 其他类型的消息，尝试作为通用命令处理
+                                result = await mcp_server.handle_generic_command(data)
+                                await websocket.send_json({
+                                    "type": "mcp.response",
+                                    "command_id": data.get("id", str(uuid.uuid4())),
+                                    "status": "success" if result.get("success", False) else "error",
+                                    "message": result.get("message", "命令已处理"),
+                                    "timestamp": datetime.now().isoformat()
+                                })
+                        else:
+                            logger.warning(f"无法识别的消息格式: {data}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "无法识别的消息格式",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                    except json.JSONDecodeError:
+                        logger.warning(f"非JSON格式消息: {message}")
+                        # 处理纯文本消息
+                        await connection_manager.send_message(message, websocket)
+                except WebSocketDisconnect:
+                    logger.info(f"客户端[{client_id}]断开命令WebSocket连接")
+                    connection_manager.disconnect(websocket, client_id)
+                    break
+                except Exception as e:
+                    logger.error(f"处理命令WebSocket消息时出错: {str(e)}")
+                    # 发送错误响应
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"处理消息时出错: {str(e)}",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    except:
+                        # 如果发送错误消息也失败，可能连接已断开
+                        break
+        except WebSocketDisconnect:
+            logger.info(f"客户端[{client_id}]断开命令WebSocket连接")
+        except Exception as e:
+            logger.error(f"命令WebSocket连接出错: {str(e)}")
+        finally:
+            connection_manager.disconnect(websocket, client_id)
 
     # 启动服务器
     port = int(os.environ.get("PORT", 9000))
