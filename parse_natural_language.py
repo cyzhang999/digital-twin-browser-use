@@ -7,8 +7,13 @@
 用于解析来自AI助手的自然语言指令，并转换为标准的MCP命令
 """
 
+import logging
 import re
 from typing import Tuple, Dict, Any, Optional
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp_server")
 
 def parse_natural_language(message: str) -> Tuple[str, Dict[str, Any]]:
     """
@@ -22,7 +27,7 @@ def parse_natural_language(message: str) -> Tuple[str, Dict[str, Any]]:
     # 解析旋转操作
     if any(keyword in message for keyword in ["旋转", "rotate", "turn", "spin"]):
         operation = "rotate"
-        
+        logger.info("解析旋转操作--------------!")
         # 提取方向
         if "左" in message or "left" in message:
             parameters["direction"] = "left"
@@ -38,6 +43,8 @@ def parse_natural_language(message: str) -> Tuple[str, Dict[str, Any]]:
         # 提取角度
         angle_match = re.search(r'(\d+)(?:\s*度|°|\s*degree)', message)
         if angle_match:
+            #todo: 旋转的度数
+            logger.info(f"旋转的度数: {angle_match.group(1)}")
             parameters["angle"] = float(angle_match.group(1))
         else:
             parameters["angle"] = 30.0  # 默认30度
