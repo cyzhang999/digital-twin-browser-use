@@ -414,7 +414,11 @@ class MCPAdapter:
         try:
             target = command.target
             direction = command.parameters.get("direction", "left")
-            angle = command.parameters.get("angle", 45)
+            # 获取前端传递的角度，确保前后端一致
+            angle = command.parameters.get("angle", 45)  # 使用前端指定的角度，默认45度
+            
+            # 记录实际使用的角度值
+            logger.info(f"执行旋转命令: direction={direction}, angle={angle}, target={target}")
             
             # 使用Playwright执行JavaScript
             result = await self.page.evaluate("""

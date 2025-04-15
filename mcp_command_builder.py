@@ -45,13 +45,13 @@ class MCPCommandBuilder:
         }
     
     @staticmethod
-    def create_rotate_command(direction: str, angle: float = 30.0, command_id: Optional[str] = None) -> Dict[str, Any]:
+    def create_rotate_command(direction: str, angle: float = 45.0, command_id: Optional[str] = None) -> Dict[str, Any]:
         """
         创建旋转模型命令
         
         Args:
             direction: 旋转方向 (left, right, up, down)
-            angle: 旋转角度，默认30度
+            angle: 旋转角度，默认45度
             command_id: 可选的命令ID
             
         Returns:

@@ -47,7 +47,7 @@ def parse_natural_language(message: str) -> Tuple[str, Dict[str, Any]]:
             logger.info(f"旋转的度数: {angle_match.group(1)}")
             parameters["angle"] = float(angle_match.group(1))
         else:
-            parameters["angle"] = 30.0  # 默认30度
+            parameters["angle"] = 45.0  # 默认45度
         
         return operation, parameters
     
