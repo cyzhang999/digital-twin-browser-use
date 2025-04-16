@@ -373,31 +373,46 @@ class ConnectionManager:
         # 先尝试使用ConnectionManager的方法
         for client_id, conn_info in self.active_connections.items():
             if conn_info["websocket"] == websocket:
+                logger.info(f"找到匹配的WebSocket连接，客户端ID：{client_id}")
                 return client_id
+        
+        logger.warning("在active_connections中未找到匹配的WebSocket连接，尝试备用查找方法")
         
         # 作为备用，获取客户端的host和port信息
         client_address = f"{websocket.client.host}"
+        logger.info(f"尝试通过客户端地址查找：{client_address}")
+        
         # 尝试查找以此地址开头的客户端
         active_clients = self.get_active_clients()
         for active_id in active_clients:
             if active_id.startswith(client_address):
+                logger.info(f"通过地址前缀找到匹配的客户端ID：{active_id}")
                 return active_id
         
         # 如果都找不到，创建一个临时ID并注册
         temp_id = f"{websocket.client.host}_{uuid.uuid4().hex[:8]}"
-        logger.info(f"为WebSocket创建临时客户端ID: {temp_id}")
+        logger.info(f"无法找到与WebSocket关联的客户端ID，创建临时ID: {temp_id}")
         
         # 在返回临时ID之前，确保它被注册到连接管理器
         try:
             # 异步注册连接
             loop = asyncio.get_event_loop()
             if loop.is_running():
+                logger.info(f"在当前运行的事件循环中注册临时客户端ID: {temp_id}")
                 asyncio.create_task(self.connect(websocket, endpoint_type="command", client_id=temp_id))
             else:
+                logger.info(f"在新事件循环中注册临时客户端ID: {temp_id}")
                 loop.run_until_complete(self.connect(websocket, endpoint_type="command", client_id=temp_id))
+            
+            # 确认注册成功
+            if temp_id in self.active_connections:
+                logger.info(f"临时客户端ID [{temp_id}] 注册成功")
+            else:
+                logger.warning(f"临时客户端ID [{temp_id}] 注册过程完成，但在active_connections中未找到")
         except Exception as e:
             logger.warning(f"注册临时客户端ID时出错: {e}")
         
+        # 无论如何都返回临时ID，以便操作能继续
         return temp_id
 
     def get_active_connections_count(self, endpoint_type=None) -> int:
@@ -516,14 +531,32 @@ class MCPServer:
                 # 处理嵌套命令 - 将嵌套命令提取到顶层
                 nested_command = command_data["command"]
                 # 保留顶层ID，但使用嵌套命令的其他字段
-                action = nested_command.get("action")
-                parameters = nested_command.get("parameters", {})
+                action = nested_command.get("action") or nested_command.get("operation")
+                parameters = nested_command.get("parameters", {}) or nested_command.get("params", {})
                 target = nested_command.get("target")
             else:
                 # 直接使用顶层字段
-                action = command_data.get("action")
-                parameters = command_data.get("parameters", {})
+                action = command_data.get("action") or command_data.get("operation")
+                # 同时检查parameters和params两个字段
+                parameters = command_data.get("parameters", {}) or command_data.get("params", {})
                 target = command_data.get("target")
+            
+            # 确保parameters是字典类型
+            if not isinstance(parameters, dict):
+                logger.warning(f"参数不是字典类型，尝试转换: {parameters}")
+                if parameters is None:
+                    parameters = {}
+                else:
+                    try:
+                        # 尝试将其作为JSON字符串解析
+                        if isinstance(parameters, str):
+                            parameters = json.loads(parameters)
+                        else:
+                            # 其他类型，转换为字典
+                            parameters = {"value": parameters}
+                    except:
+                        # 解析失败，使用空字典
+                        parameters = {"raw_value": str(parameters)}
             
             # 检查操作类型
             if not action:
@@ -548,7 +581,9 @@ class MCPServer:
             # 获取客户端ID
             client_id = None
             try:
+                logger.info(f"尝试获取WebSocket的客户端ID: {websocket.client.host}")
                 client_id = connection_manager.get_client_by_websocket(websocket)
+                logger.info(f"获取到客户端ID: {client_id}")
             except Exception as e:
                 logger.warning(f"获取客户端ID时出错: {e}")
                 
@@ -567,6 +602,7 @@ class MCPServer:
             # 添加通用参数
             if isinstance(parameters, dict):
                 parameters["client_id"] = client_id
+                logger.info(f"向命令参数添加客户端ID: {client_id}")
             
             # 查找操作处理器
             handler = self.operation_handlers.get_handler(action)
@@ -932,16 +968,43 @@ class MCPServer:
     async def execute_zoom_operation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """执行缩放操作"""
         try:
-            scale = params.get("scale")
+            # 尝试从不同位置和格式提取缩放值
+            scale = None
+            
+            # 直接检查scale字段
+            if "scale" in params:
+                scale = params["scale"]
+            # 检查parameters.scale (嵌套)
+            elif "parameters" in params and isinstance(params["parameters"], dict) and "scale" in params["parameters"]:
+                scale = params["parameters"]["scale"]
+            # 检查params.scale (嵌套)
+            elif "params" in params and isinstance(params["params"], dict) and "scale" in params["params"]:
+                scale = params["params"]["scale"]
+            
+            # 如果所有方法都失败，尝试查找任何可能表示缩放的字段
+            if scale is None:
+                # 检查所有类似scale的字段
+                for key in params:
+                    if key.lower() in ["scale", "zoom", "scalefactor", "zoomfactor"]:
+                        scale = params[key]
+                        logger.info(f"从字段 {key} 提取缩放值: {scale}")
+                        break
 
             if scale is None:
+                logger.warning(f"无法提取缩放值，参数: {params}")
                 return {"success": False, "message": "缺少缩放参数"}
 
             # 确保scale是数值类型
-            if isinstance(scale, dict) and "scale" in scale:
-                scale = float(scale["scale"])
-            else:
-                scale = float(scale)
+            try:
+                if isinstance(scale, dict) and "scale" in scale:
+                    scale = float(scale["scale"])
+                elif isinstance(scale, dict) and "value" in scale:
+                    scale = float(scale["value"])
+                else:
+                    scale = float(scale)
+            except (ValueError, TypeError) as e:
+                logger.error(f"缩放值转换为浮点数失败: {scale}, 错误: {e}")
+                return {"success": False, "message": f"缩放值必须是数字, 收到: {scale}"}
 
             if scale <= 0:
                 return {"success": False, "message": "缩放比例必须大于0"}
@@ -1163,7 +1226,7 @@ class MCPServer:
                 "success": True,
                 "message": f"缩放命令已处理，但可能未成功执行",
                 "data": {
-                    "scale": scale
+                    "scale": scale if 'scale' in locals() else "未知"
                 }
             }
 
@@ -1343,7 +1406,7 @@ class MCPServer:
             # 检查各种可能的字段名
             if "action" in command:
                 action = command["action"]
-                parameters = command.get("parameters", {})
+                parameters = command.get("parameters", {}) or command.get("params", {})
             elif "operation" in command:
                 action = command["operation"]
                 parameters = command.get("parameters", {}) or command.get("params", {})
@@ -1357,10 +1420,27 @@ class MCPServer:
                 nested = command["command"]
                 if "action" in nested:
                     action = nested["action"]
-                    parameters = nested.get("parameters", {})
+                    parameters = nested.get("parameters", {}) or nested.get("params", {})
                 elif "operation" in nested:
                     action = nested["operation"]
                     parameters = nested.get("parameters", {}) or nested.get("params", {})
+            
+            # 确保parameters是字典类型
+            if not isinstance(parameters, dict):
+                logger.warning(f"参数不是字典类型，尝试转换: {parameters}")
+                if parameters is None:
+                    parameters = {}
+                else:
+                    try:
+                        # 尝试将其作为JSON字符串解析
+                        if isinstance(parameters, str):
+                            parameters = json.loads(parameters)
+                        else:
+                            # 其他类型，转换为字典
+                            parameters = {"value": parameters}
+                    except:
+                        # 解析失败，使用空字典
+                        parameters = {"raw_value": str(parameters)}
             
             # 如果仍然没有找到操作类型，返回错误
             if not action:
@@ -1471,13 +1551,8 @@ def main():
     # 让MCP服务器能够访问connection_manager
     mcp_server.connection_manager = connection_manager
     
-    operation_handler = OperationHandler()
-
-    # 注册操作处理函数 - 使用MCP服务器中的方法
-    operation_handler.register_operation("rotate", mcp_server.execute_rotate_operation)
-    operation_handler.register_operation("zoom", mcp_server.execute_zoom_operation)
-    operation_handler.register_operation("focus", mcp_server.execute_focus_operation)
-    operation_handler.register_operation("reset", mcp_server.execute_reset_operation)
+    # 使用MCP服务器自己的operation_handlers，确保已正确注册所有操作处理器
+    logger.info(f"已注册的操作: {mcp_server.operation_handlers.get_registered_operations()}")
 
     # WebSocket连接端点
     @app.websocket("/ws")
@@ -1688,11 +1763,19 @@ def main():
         client_id = await connection_manager.connect(websocket, endpoint_type="command")
         
         try:
+            # 发送欢迎消息
+            await websocket.send_json({
+                "type": "welcome",
+                "message": "已连接到MCP服务器",
+                "client_id": client_id,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # 循环处理消息
             while True:
-                message = await websocket.receive_text()
                 try:
-                    data = json.loads(message)
-                    logger.info(f"收到MCP消息: {data}")
+                    data = await websocket.receive_json()
+                    logger.info(f"收到客户端[{client_id}]的命令消息: {data}")
                     
                     # 处理初始化消息
                     if data.get("type") == "init":
@@ -1706,51 +1789,55 @@ def main():
                         logger.info("发送初始化响应成功")
                         continue
                     
-                    # 处理状态请求消息
-                    if data.get("type") == "status.request":
+                    # 处理ping消息
+                    if data.get("type") == "ping":
                         await websocket.send_json({
-                            "type": "status",
-                            "data": {
-                                "connected": True,
-                                "service": "mcp_server",
-                                "client_id": client_id,
-                                "operations": operation_handler.get_registered_operations(),
-                                "timestamp": datetime.now().isoformat()
-                            }
+                            "type": "pong",
+                            "timestamp": datetime.now().isoformat()
                         })
-                        logger.info("发送状态响应成功")
                         continue
                     
-                    # 处理MCP命令消息
-                    if data.get("type") == "mcp.command":
-                        await mcp_server.handle_command(websocket, data)
+                    # 其他MCP命令处理...
+                    if data.get("type") == "mcp.command" or data.get("action"):
+                        # 处理MCP命令
+                        result = await mcp_server.handle_generic_command(data)
+                        
+                        # 发送响应
+                        await websocket.send_json({
+                            "type": "mcp.response",
+                            "command_id": data.get("id"),
+                            "status": "success" if result.get("success", False) else "error",
+                            "result": result,
+                            "timestamp": datetime.now().isoformat()
+                        })
                     else:
-                        logger.warning(f"未知MCP消息类型: {data.get('type')}")
+                        # 未知消息类型
+                        logger.warning(f"未知消息类型: {data.get('type')}")
                         await websocket.send_json({
                             "type": "error",
                             "message": f"未知消息类型: {data.get('type')}",
                             "timestamp": datetime.now().isoformat()
                         })
                 except json.JSONDecodeError:
-                    logger.error(f"非JSON格式的MCP消息: {message}")
+                    logger.error("收到无效的JSON消息")
                     await websocket.send_json({
                         "type": "error",
-                        "message": "消息格式无效，需要JSON格式",
+                        "message": "无效的JSON消息",
                         "timestamp": datetime.now().isoformat()
                     })
                 except Exception as e:
-                    logger.error(f"处理MCP消息时出错: {e}")
+                    logger.error(f"处理消息时出错: {str(e)}")
                     await websocket.send_json({
                         "type": "error",
-                        "message": f"处理消息时出错: {e}",
+                        "message": f"处理消息时出错: {str(e)}",
                         "timestamp": datetime.now().isoformat()
                     })
         except WebSocketDisconnect:
-            logger.info(f"MCP WebSocket断开连接")
-            connection_manager.disconnect(websocket, client_id)
+            logger.info(f"客户端[{client_id}]断开连接")
+            connection_manager.disconnect(None, client_id)
         except Exception as e:
-            logger.error(f"MCP WebSocket连接错误: {e}")
-            connection_manager.disconnect(websocket, client_id)
+            logger.error(f"WebSocket连接出错: {str(e)}")
+            connection_manager.disconnect(None, client_id)
 
     # 添加健康检查端点
     @app.get("/health")
@@ -1765,7 +1852,7 @@ def main():
         return {
             "status": "available",
             "connections": connection_manager.get_active_connections_count(),
-            "operations": operation_handler.get_registered_operations()
+            "operations": mcp_server.operation_handlers.get_registered_operations()
         }
 
     # 添加AI助手请求处理接口
@@ -1795,7 +1882,7 @@ def main():
                 )
 
             # 获取操作处理器
-            handler = operation_handler.get_handler(operation)
+            handler = mcp_server.operation_handlers.get_handler(operation)
             if not handler:
                 return JSONResponse(
                     status_code=404,
@@ -1835,7 +1922,7 @@ def main():
                 )
 
             # 获取操作处理器
-            handler = operation_handler.get_handler(operation)
+            handler = mcp_server.operation_handlers.get_handler(operation)
             if not handler:
                 return JSONResponse(
                     status_code=404,
@@ -1915,24 +2002,32 @@ def main():
                         if isinstance(data, dict):
                             # 检查命令格式
                             if data.get("type") == "mcp.command":
-                                # 处理顶层命令
-                                if "action" in data:
-                                    # 直接处理顶层命令
+                                # 处理带操作类型的命令
+                                if "action" in data or "operation" in data:
+                                    # 如果有操作字段，将operation转换为action
+                                    if "operation" in data and "action" not in data:
+                                        logger.info(f"将operation字段转换为action: {data['operation']}")
+                                        data["action"] = data["operation"]
+                                    # 直接处理带action字段的命令
                                     await mcp_server.handle_command(websocket, data)
                                 elif "command" in data and isinstance(data["command"], dict):
                                     # 处理嵌套命令
                                     await mcp_server.handle_command(websocket, data)
                                 else:
                                     # 缺少必要字段
-                                    logger.warning(f"命令缺少action或command字段: {data}")
+                                    logger.warning(f"命令缺少action/operation或command字段: {data}")
                                     await websocket.send_json({
                                         "type": "mcp.response",
                                         "command_id": data.get("id", str(uuid.uuid4())),
                                         "status": "error",
-                                        "message": "命令缺少action或command字段",
+                                        "message": "命令缺少action/operation或command字段",
                                         "timestamp": datetime.now().isoformat()
                                     })
-                            elif "action" in data:
+                            elif "action" in data or "operation" in data:
+                                # 如果有操作字段，将operation转换为action
+                                if "operation" in data and "action" not in data:
+                                    logger.info(f"将operation字段转换为action: {data['operation']}")
+                                    data["action"] = data["operation"]
                                 # 直接处理带action字段的命令
                                 await mcp_server.handle_command(websocket, data)
                             else:
